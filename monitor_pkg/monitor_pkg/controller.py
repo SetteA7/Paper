@@ -41,7 +41,7 @@ class LaserProcessor(Node):
         super().__init__('laser_processor')
         
         # --- Laser Variables ---
-        self.k = 100                # Number of samples to use at beginning/end of array
+        self.k = 101                # Number of samples to use at beginning/end of array
 
         # --- Controller Variables ---
         # Robot Parameters
