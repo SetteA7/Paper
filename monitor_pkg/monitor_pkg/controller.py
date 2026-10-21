@@ -1,5 +1,3 @@
-Now tell me what to fix here. Reduce the logs in both the file output (disable it completely for now) and also the terminal logs. Is this code slow?
-
 import csv
 import math
 import signal
