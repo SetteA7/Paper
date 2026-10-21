@@ -81,7 +81,8 @@ class LaserProcessor(Node):
         
         self.subscription = self.create_subscription(
             LaserScan,
-            '/scan_filtered',
+            #'/scan_filtered',
+            '/scan',
             self.scan_callback,
             qos_profile_sensor_data
         )
