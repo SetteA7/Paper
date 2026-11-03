@@ -18,7 +18,7 @@ from monitor_pkg.network_link import LinkStats, NetworkMonitor
 
 # ============================================================== TOGGLES
 ENABLE_SMART = False    # True: adaptive threshold from network stats; False: fixed SAFE_THRESHOLD
-ENABLE_CSV = False      # True: write one CSV row per scan into CSV_DIR
+ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
 CSV_DIR = "/home/user/ros2_ws_A7"
 
 
