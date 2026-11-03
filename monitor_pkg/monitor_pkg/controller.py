@@ -52,6 +52,7 @@ class LaserProcessor(Node):
         self.current_N = 1
 
         # --- Network variables (updated by on_link_update) ---
+        # Placeholders until the first heartbeat from the bot arrives.
         self.tau_tx = 10
         self.tau_rx = 10
         self.taue2e = self.tau_rx + self.tau_tx
@@ -111,7 +112,12 @@ class LaserProcessor(Node):
 
     # --------------------------------------------------------------- Network
     def on_link_update(self, s: LinkStats):
-        """Called by NetworkMonitor for every echoed packet."""
+        """Called by NetworkMonitor once per heartbeat period (default 0.1 s).
+
+        tx = uplink (controller -> bot), measured by the bot and reported back.
+        rx = downlink (bot -> controller), measured here. If the link goes silent,
+        loss rises towards 1 (counted per missed period), so current_N grows.
+        """
         self.p_tx, self.p_rx, self.pe2e = s.p_tx, s.p_rx, s.p_e2e
         self.tau_tx, self.tau_rx, self.taue2e = s.tau_tx, s.tau_rx, s.tau_e2e
         self.update(s.p_tx, s.p_rx)
