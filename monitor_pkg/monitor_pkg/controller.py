@@ -1,6 +1,7 @@
 import bisect
 import csv
 import os
+import sys
 from datetime import datetime
 
 import numpy as np
@@ -9,6 +10,7 @@ import rclpy
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.utilities import remove_ros_args
 
 from geometry_msgs.msg import TwistStamped
 from sensor_msgs.msg import LaserScan
@@ -17,6 +19,7 @@ from monitor_pkg.network_link import LinkStats, NetworkMonitor
 
 
 # ============================================================== TOGGLES
+# Defaults; override at launch: ros2 run monitor_pkg controller_monitor SMART NOCSV
 ENABLE_SMART = False    # True: adaptive threshold from network stats; False: fixed SAFE_THRESHOLD
 ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
 CSV_DIR = "/home/user/ros2_ws_A7"
@@ -297,10 +300,31 @@ class LaserProcessor(Node):
         return self.current_N
 
 
+def parse_flags(argv):
+    """Command-line toggles, e.g. `ros2 run monitor_pkg controller_monitor SMART NOCSV`.
+    Anything not given falls back to ENABLE_SMART / ENABLE_CSV."""
+    smart, log_csv = ENABLE_SMART, ENABLE_CSV
+    for arg in argv:
+        flag = arg.upper()
+        if flag == 'SMART':
+            smart = True
+        elif flag == 'NOSMART':
+            smart = False
+        elif flag == 'CSV':
+            log_csv = True
+        elif flag == 'NOCSV':
+            log_csv = False
+        else:
+            raise SystemExit(f"Unknown option '{arg}'. Use: SMART | NOSMART | CSV | NOCSV")
+    return smart, log_csv
+
+
 def main(args=None):
+    # Strip --ros-args ... so only our own flags are left
+    smart, log_csv = parse_flags(remove_ros_args(args=sys.argv)[1:])
     rclpy.init(args=args)
 
-    laser_node = LaserProcessor()
+    laser_node = LaserProcessor(smart=smart, log_csv=log_csv)
     # log_period=None: the controller logs the network stats in log_status()
     network_node = NetworkMonitor(on_update=laser_node.on_link_update, log_period=None)
 
