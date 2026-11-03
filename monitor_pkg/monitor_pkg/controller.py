@@ -60,6 +60,7 @@ class LaserProcessor(Node):
         self.scan_detail = ''
         self.link_seen = False
         self.current_N = 1
+        self._last_sent_brake = None    # last command sent, to log only on changes
 
         # --- Network (placeholders until the first heartbeat from the bot) ---
         self.tau_tx = 10
@@ -171,34 +172,54 @@ class LaserProcessor(Node):
     def _scan_stale(self, now_ns: int) -> bool:
         return self.last_scan_ns is None or (now_ns - self.last_scan_ns) > self.SCAN_TIMEOUT_NS
 
+    # -------------------------------------------------------------- Decision
+    def _decision(self, now_ns: int) -> tuple[bool, str]:
+        """(brake, reason). Same rule as before: brake if last scan said so or lidar is stale."""
+        if self.scan_status == 'none':
+            return True, 'no lidar data'
+        if self._scan_stale(now_ns):
+            return True, f'lidar stale ({(now_ns - self.last_scan_ns) * 1e-9:.1f} s)'
+        if self.scan_status != 'ok':
+            return True, f'{self.scan_status} scan'
+        op = '<' if self.last_brake_state else '>='
+        return self.last_brake_state, f'{self.min_dist_cm:.1f} {op} {self.safe_threshold:.1f} cm'
+
+    def _mode_str(self) -> str:
+        if self.smart:
+            return f'SMART thr {self.safe_threshold:5.1f} cm (N={self.current_N})'
+        return f'FIXED thr {self.safe_threshold:5.1f} cm'
+
     # ---------------------------------------------------------------- Status
     def log_status(self):
-        """One LIDAR line + one NET line. Yellow = lidar problem, red = no /scan at all."""
+        """Every STATUS_PERIOD: NET, then DIST, then DECISION."""
         log = self.get_logger()
         now_ns = self.get_clock().now().nanoseconds
 
-        if self.scan_status == 'none':
-            log.error('LIDAR | NO DATA on /scan (topic missing or driver not running) | BRAKE')
-        elif self._scan_stale(now_ns):
-            age = (now_ns - self.last_scan_ns) * 1e-9
-            log.warn(f'LIDAR | STALE: last scan {age:.1f} s ago | BRAKE')
-        elif self.scan_status == 'empty':
-            log.warn('LIDAR | EMPTY scan (ranges array is empty) | BRAKE')
-        elif self.scan_status == 'invalid':
-            log.warn(f'LIDAR | NO VALID reading: {self.scan_detail} | BRAKE')
-        else:
-            state = 'BRAKE' if self.last_brake_state else 'GO'
-            mode = 'smart' if self.smart else 'fixed'
-            log.info(f'LIDAR | min {self.min_dist_cm:6.1f} cm | '
-                     f'thr {self.safe_threshold:5.1f} cm ({mode}) | {state}')
-
+        # 1. Network
         if not self.link_seen:
-            log.warn('NET   | no heartbeat from the bot yet')
+            log.warn('NET      | no heartbeat from the bot yet')
         else:
-            log.info(f'NET   | tau tx {self.tau_tx:5.1f} rx {self.tau_rx:5.1f} '
+            log.info(f'NET      | tau tx {self.tau_tx:5.1f} rx {self.tau_rx:5.1f} '
                      f'e2e {self.taue2e:5.1f} ms | '
                      f'p tx {self.p_tx * 100:4.1f}% rx {self.p_rx * 100:4.1f}% '
-                     f'e2e {self.pe2e * 100:4.1f}% | N={self.current_N}')
+                     f'e2e {self.pe2e * 100:4.1f}%')
+
+        # 2. Distance
+        if self.scan_status == 'none':
+            log.error('DIST     | NO DATA on /scan (topic missing or driver not running)')
+        elif self._scan_stale(now_ns):
+            log.warn('DIST     | lidar STALE (no recent scan)')
+        elif self.scan_status == 'empty':
+            log.warn('DIST     | EMPTY scan (ranges array is empty)')
+        elif self.scan_status == 'invalid':
+            log.warn(f'DIST     | NO VALID reading: {self.scan_detail}')
+        else:
+            log.info(f'DIST     | min {self.min_dist_cm:6.1f} cm')
+
+        # 3. Decision
+        brake, reason = self._decision(now_ns)
+        action = 'BRAKE' if brake else f'SAFE, moving {self.LINEAR_SPEED} m/s'
+        log.info(f'DECISION | {self._mode_str()} | {action} ({reason})')
 
     # --------------------------------------------------------------- Command
     def _publish_speed(self, speed: float):
@@ -207,8 +228,16 @@ class LaserProcessor(Node):
         self.publisher_.publish(self._msg)
 
     def publish_cmd(self):
-        brake = self.last_brake_state or self._scan_stale(self.get_clock().now().nanoseconds)
+        brake, reason = self._decision(self.get_clock().now().nanoseconds)
         self._publish_speed(0.0 if brake else self.LINEAR_SPEED)
+
+        # Log immediately whenever the command changes (not only once per second)
+        if brake != self._last_sent_brake:
+            self._last_sent_brake = brake
+            if brake:
+                self.get_logger().warn(f'>>> BRAKE sent | {self._mode_str()} | {reason}')
+            else:
+                self.get_logger().info(f'>>> SAFE, moving | {self._mode_str()} | {reason}')
 
     def stop_robot(self):
         self._publish_speed(0.0)
