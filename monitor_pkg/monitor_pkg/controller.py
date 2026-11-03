@@ -21,6 +21,8 @@ class LaserProcessor(Node):
     N_MAX = 200
     # If no scan arrives for this long, brake (lidar dead / driver crashed)
     SCAN_TIMEOUT_NS = 500_000_000  # 0.5 s
+    # Period of the combined lidar + network status log
+    STATUS_PERIOD = 1.0  # s
 
     def __init__(self):
         super().__init__('laser_processor')
@@ -46,6 +48,11 @@ class LaserProcessor(Node):
         self.last_brake_state = True
         self.min_dist_cm = -1.0
         self.last_scan_ns = None
+        # Last scan outcome, for the status log: 'none' (no /scan ever),
+        # 'empty' (ranges array empty), 'invalid' (no value in bounds), 'ok'
+        self.scan_status = 'none'
+        self.scan_detail = ''
+        self.link_seen = False
 
         self.P_target = 0.05
         self.max_linear_steps = 4
@@ -73,6 +80,7 @@ class LaserProcessor(Node):
             qos_profile_sensor_data,
         )
         self.timer = self.create_timer(0.05, self.publish_cmd)
+        self.status_timer = self.create_timer(self.STATUS_PERIOD, self.log_status)
 
         # --- CSV logging (DISABLED: set to True to re-enable) ---
         self.log_csv = False
@@ -118,6 +126,7 @@ class LaserProcessor(Node):
         rx = downlink (bot -> controller), measured here. If the link goes silent,
         loss rises towards 1 (counted per missed period), so current_N grows.
         """
+        self.link_seen = True
         self.p_tx, self.p_rx, self.pe2e = s.p_tx, s.p_rx, s.p_e2e
         self.tau_tx, self.tau_rx, self.taue2e = s.tau_tx, s.tau_rx, s.tau_e2e
         self.update(s.p_tx, s.p_rx)
@@ -139,15 +148,56 @@ class LaserProcessor(Node):
             )
 
         if valid.size > 0:
+            self.scan_status = 'ok'
             self.min_dist_cm = float(valid.min()) * 100.0
             self.last_brake_state = self.min_dist_cm < self.safe_threshold
         else:
-            self.get_logger().warn("No valid lidar readings!", throttle_duration_sec=5.0)
+            if zone.size == 0:
+                self.scan_status = 'empty'
+            else:
+                self.scan_status = 'invalid'
+                finite = zone[np.isfinite(zone)]
+                raw = (f'measured {finite.min():.2f}..{finite.max():.2f} m'
+                       if finite.size else 'all inf/NaN')
+                self.scan_detail = (
+                    f'{zone.size} samples, none inside [{msg.range_min:.2f}, '
+                    f'{msg.range_max:.2f}] m ({raw})'
+                )
             self.min_dist_cm = -1.0
             self.last_brake_state = True
 
         if self.csv_writer is not None:
             self.log_to_csv()
+
+    # ---------------------------------------------------------------- Status
+    def log_status(self):
+        """One LIDAR line + one NET line. Yellow = lidar problem, red = no /scan at all."""
+        log = self.get_logger()
+
+        if self.scan_status == 'none':
+            log.error('LIDAR | NO DATA: nothing ever received on /scan '
+                      '(topic missing or lidar driver not running) | BRAKE')
+        else:
+            age = (self.get_clock().now().nanoseconds - self.last_scan_ns) * 1e-9
+            if age * 1e9 > self.SCAN_TIMEOUT_NS:
+                log.warn(f'LIDAR | STALE: last scan {age:.1f} s ago (lidar stopped?) | BRAKE')
+            elif self.scan_status == 'empty':
+                log.warn('LIDAR | EMPTY scan: ranges array is empty (lidar not working) | BRAKE')
+            elif self.scan_status == 'invalid':
+                log.warn(f'LIDAR | NO VALID reading: {self.scan_detail} | BRAKE')
+            else:
+                state = 'BRAKE' if self.last_brake_state else 'GO'
+                log.info(f'LIDAR | min {self.min_dist_cm:6.1f} cm | '
+                         f'threshold {self.safe_threshold:5.1f} cm | {state}')
+
+        if not self.link_seen:
+            log.warn('NET   | no heartbeat from the bot yet')
+        else:
+            log.info(
+                f'NET   | latency tx {self.tau_tx:5.1f}  rx {self.tau_rx:5.1f}  '
+                f'e2e {self.taue2e:5.1f} ms | loss tx {self.p_tx * 100:5.1f}%  '
+                f'rx {self.p_rx * 100:5.1f}%  e2e {self.pe2e * 100:5.1f}% | N={self.current_N}'
+            )
 
     def publish_cmd(self):
         now = self.get_clock().now()
@@ -226,7 +276,8 @@ def main(args=None):
     rclpy.init(args=args)
 
     laser_node = LaserProcessor()
-    network_node = NetworkMonitor(on_update=laser_node.on_link_update)
+    # log_period=None: the controller logs the network stats in log_status()
+    network_node = NetworkMonitor(on_update=laser_node.on_link_update, log_period=None)
 
     executor = SingleThreadedExecutor()
     executor.add_node(laser_node)

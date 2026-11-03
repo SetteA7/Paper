@@ -149,10 +149,11 @@ class NetworkMonitor(Peer):
     """Controller side: measures the downlink, gets the uplink from the bot.
 
     `on_update(LinkStats)` is called every period once the bot has been heard.
+    `log_period=None` disables this node's own logging (the caller logs instead).
     """
 
     def __init__(self, on_update: Callable[[LinkStats], None], send_period: float = 0.1,
-                 window: int = 100, log_period: float = 2.0, timeout: float = 0.5):
+                 window: int = 100, log_period: float | None = 2.0, timeout: float = 0.5):
         super().__init__('network_monitor_client', 'network_uplink', 'network_downlink',
                          send_period, window, timeout)
         self.on_update = on_update
@@ -160,17 +161,19 @@ class NetworkMonitor(Peer):
 
     def on_period(self):
         if self.last_msg is None:
-            self.get_logger().warn('No heartbeat from the bot yet', throttle_duration_sec=5.0)
+            if self.log_period:
+                self.get_logger().warn('No heartbeat from the bot yet', throttle_duration_sec=5.0)
             return
         tau_tx, p_tx = self.last_msg.up_lat, self.last_msg.up_loss
         tau_rx, p_rx = self.incoming.latency, self.incoming.loss
         p_e2e = p_tx + p_rx - p_tx * p_rx
 
-        self.get_logger().info(
-            f'lat tx/rx/e2e {tau_tx:.1f}/{tau_rx:.1f}/{tau_tx + tau_rx:.1f} ms | '
-            f'loss tx/rx/e2e {p_tx * 100:.1f}/{p_rx * 100:.1f}/{p_e2e * 100:.1f} %',
-            throttle_duration_sec=self.log_period,
-        )
+        if self.log_period:
+            self.get_logger().info(
+                f'lat tx/rx/e2e {tau_tx:.1f}/{tau_rx:.1f}/{tau_tx + tau_rx:.1f} ms | '
+                f'loss tx/rx/e2e {p_tx * 100:.1f}/{p_rx * 100:.1f}/{p_e2e * 100:.1f} %',
+                throttle_duration_sec=self.log_period,
+            )
         self.on_update(LinkStats(
             tau_tx=tau_tx, tau_rx=tau_rx, tau_e2e=tau_tx + tau_rx,
             p_tx=p_tx, p_rx=p_rx, p_e2e=p_e2e,
