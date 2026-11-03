@@ -1,24 +1,28 @@
-"""Networking part of the link monitor.
+"""Link monitor: latency and packet loss in both directions.
 
-Contains:
-  - LossWindow:     sliding-window packet-loss estimator (shared by both nodes)
-  - LinkStats:      snapshot of latency/loss handed to the controller
-  - NetworkServer:  echo node (runs on the remote machine)
-  - NetworkMonitor: probing node (runs next to the controller)
+Both ends run the same logic (Peer):
+  - every `period` s, publish a heartbeat on their own topic (seq + send time)
+  - receive the other end's heartbeats and measure that incoming direction:
+      loss    = missing seq numbers in a sliding window. If nothing arrives for
+                `timeout` s, one packet per period is counted as lost. This is
+                what makes it work over TCP too: there packets are not dropped,
+                the link stalls and they arrive late (or never).
+      latency = receive time - send time (one-way, needs synced clocks)
+  - put their measurement of the incoming direction (up_lat / up_loss fields)
+    in their own heartbeat. That's how the controller learns the uplink values.
 
-The controller does NOT need to know anything about topics or QoS: it just
-passes a callback to NetworkMonitor and receives a LinkStats every packet.
+Directions (from the controller's point of view):
+  tx = uplink   controller -> bot, topic `network_uplink`   (measured by the bot)
+  rx = downlink bot -> controller, topic `network_downlink` (measured by the controller)
 
-Directions (tx/rx are from the controller's point of view):
-  uplink   (tx): controller -> responder, topic `network_uplink`
-  downlink (rx): responder  -> controller, topic `network_downlink`
+Heartbeats are independent in each direction (no echo), so a dead uplink does
+not show up as downlink loss.
 
-Loss is measured per direction with INDEPENDENT sequence numbers:
-  - uplink loss   = gaps in the probe seq, measured by the responder
-  - downlink loss = gaps in the echo seq (the responder's own counter),
-                    measured by the controller
-Using the probe seq for both would count uplink losses twice (a probe lost on
-the uplink is never echoed, so it would show up as a downlink gap too).
+Clocks: one-way latencies are only correct if both machines are synced
+(chrony). With an offset theta, tx = true_tx + theta and rx = true_rx - theta,
+so tau_e2e = tx + rx is always correct.
+
+`period` and `window` must be the same on both ends.
 """
 import statistics
 import time
@@ -32,72 +36,6 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from link_monitor_msg.msg import LinkState
 
 
-def make_qos(node: Node) -> QoSProfile:
-    """QoS selected by the `best_effort` ROS parameter (must match on both ends).
-
-    best_effort:=true  -> real packet loss is visible (recommended for measuring)
-    best_effort:=false -> reliable, the middleware retransmits and hides loss
-    """
-    node.declare_parameter('best_effort', False)
-    if node.get_parameter('best_effort').value:
-        return QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
-    return QoSProfile(
-        reliability=ReliabilityPolicy.RELIABLE,
-        history=HistoryPolicy.KEEP_LAST,
-        depth=10,
-    )
-
-
-class LossWindow:
-    """Sliding-window loss estimator based on sequence numbers.
-
-    - the first packet is the baseline: nothing is counted as lost before it
-    - gaps are counted as losses (capped at `size`, so a huge jump is O(size))
-    - duplicate / late packets are ignored
-    - a sender restart (seq going back to 0 or far back) resets the window
-    """
-
-    def __init__(self, size: int = 100, detect_restart: bool = True):
-        self.size = size
-        self.detect_restart = detect_restart
-        self.expected = None          # unknown until the first packet arrives
-        self.resets = 0
-        self.received = deque(maxlen=size)  # 1 = received, 0 = lost
-
-    def reset(self):
-        self.received.clear()
-        self.expected = None
-        self.resets += 1
-
-    def update(self, seq: int) -> bool:
-        """Register a received seq. Returns True if it was counted."""
-        if self.expected is None:
-            self.expected = seq
-        elif seq < self.expected:
-            restarted = self.detect_restart and (
-                seq == 0 or (self.expected - seq) > self.size
-            )
-            if not restarted:
-                return False  # duplicate / late packet
-            self.reset()
-            self.expected = seq
-
-        gap = seq - self.expected
-        self.received.extend([0] * min(gap, self.size))
-        self.received.append(1)
-        self.expected = seq + 1
-        return True
-
-    @property
-    def loss(self) -> float:
-        n = len(self.received)
-        return 1.0 - (sum(self.received) / n) if n else 0.0
-
-
 @dataclass(frozen=True)
 class LinkStats:
     tau_tx: float   # ms, median uplink latency
@@ -108,110 +46,132 @@ class LinkStats:
     p_e2e: float
 
 
-class NetworkServer(Node):
-    """Echoes every uplink packet back, adding uplink latency and loss."""
+class Direction:
+    """Loss and latency of one incoming direction, over the last `window` packets."""
 
-    def __init__(self):
-        super().__init__('network_monitor_server')
+    def __init__(self, window: int, timeout: float):
+        self.window = window
+        self.timeout = timeout
+        self.received = deque(maxlen=window)  # 1 = received, 0 = lost
+        self.latencies = deque(maxlen=window)  # ms
+        self.expected = None                   # next seq we expect
+        self.last_rx = time.time()
 
-        self.declare_parameter('window', 100)
-        window = int(self.get_parameter('window').value)
-        qos = make_qos(self)
+    def on_packet(self, seq: int, ts_sent: float, now: float):
+        restarted = self.expected is not None and seq < self.expected and (
+            seq == 0 or self.expected - seq > self.window)
+        if self.expected is None or restarted:
+            self.expected = seq                # first packet / sender restarted
+        elif seq < self.expected:
+            return                             # late or duplicate: already counted lost
+        self.received.extend([0] * min(seq - self.expected, self.window))
+        self.received.append(1)
+        self.expected = seq + 1
+        self.last_rx = now
+        self.latencies.append((now - ts_sent) * 1000.0)
 
-        self.sub = self.create_subscription(LinkState, 'network_uplink', self._on_uplink, qos)
-        self.pub = self.create_publisher(LinkState, 'network_downlink', qos)
+    def on_tick(self, now: float):
+        """Call once per period: counts a lost packet while the link is silent."""
+        if now - self.last_rx > self.timeout:
+            self.received.append(0)
+            if self.expected is not None:
+                self.expected += 1
 
-        self.up_loss = LossWindow(window)
-        self.dn_seq = 0  # echo counter: lets the controller measure downlink loss alone
+    @property
+    def loss(self) -> float:
+        n = len(self.received)
+        return 1.0 - sum(self.received) / n if n else 1.0
 
-    def _on_uplink(self, msg: LinkState):
-        # One-way latency: only meaningful if both machines' clocks are synchronized
-        # (chrony / PTP). Otherwise it includes the clock offset.
-        up_lat_ms = (time.time() - msg.ts_sent) * 1000.0
-
-        resets = self.up_loss.resets
-        self.up_loss.update(msg.seq)
-        if self.up_loss.resets != resets:
-            self.get_logger().warn(f'Client restart detected (seq={msg.seq}): loss window reset')
-
-        res = LinkState()
-        res.ts_sent = time.time()
-        res.seq = self.dn_seq   # NOT msg.seq, see module docstring
-        self.dn_seq += 1
-        res.up_lat = up_lat_ms
-        res.up_loss = float(self.up_loss.loss)
-        self.pub.publish(res)
+    @property
+    def latency(self) -> float:
+        return statistics.median(self.latencies) if self.latencies else 0.0
 
 
-class NetworkMonitor(Node):
-    """Sends probe packets and computes latency/loss statistics from the echoes.
+class Peer(Node):
+    """Publishes heartbeats on `tx_topic`, measures the heartbeats on `rx_topic`."""
 
-    `on_update(LinkStats)` is called for every echoed packet received.
-    """
+    def __init__(self, name, tx_topic, rx_topic, period=0.1, window=100, timeout=0.5):
+        super().__init__(name)
+        period = float(self.declare_parameter('period', period).value)
+        window = int(self.declare_parameter('window', window).value)
+        timeout = float(self.declare_parameter('timeout', timeout).value)
 
-    def __init__(
-        self,
-        on_update: Callable[[LinkStats], None],
-        send_period: float = 0.1,
-        window: int = 100,
-        log_period: float = 2.0,
-    ):
-        super().__init__('network_monitor_client')
+        # best_effort:=true (default) shows the real loss; reliable QoS makes the
+        # middleware retransmit, so loss turns into latency. Must match on both ends.
+        if self.declare_parameter('best_effort', True).value:
+            qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                             history=HistoryPolicy.KEEP_LAST, depth=1)
+        else:
+            qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                             history=HistoryPolicy.KEEP_LAST, depth=10)
 
-        qos = make_qos(self)
-        self.pub = self.create_publisher(LinkState, 'network_uplink', qos)
-        self.sub = self.create_subscription(LinkState, 'network_downlink', self._on_downlink, qos)
-        self.create_timer(send_period, self._send_packet)
+        self.pub = self.create_publisher(LinkState, tx_topic, qos)
+        self.create_subscription(LinkState, rx_topic, self._on_msg, qos)
+        self.create_timer(period, self._on_timer)
 
-        self.on_update = on_update
-        self.log_period = log_period
+        self.incoming = Direction(window, timeout)
+        self.last_msg = None  # last heartbeat from the other end
         self.seq = 0
 
-        self.dn_loss = LossWindow(window)
-        self.history_up_lat = deque(maxlen=window)
-        self.history_dn_lat = deque(maxlen=window)
+    def _on_msg(self, msg: LinkState):
+        self.incoming.on_packet(msg.seq, msg.ts_sent, time.time())
+        self.last_msg = msg
 
-    def _send_packet(self):
+    def _on_timer(self):
+        self.incoming.on_tick(time.time())
         msg = LinkState()
-        msg.ts_sent = time.time()
         msg.seq = self.seq
+        msg.up_lat = float(self.incoming.latency)  # what *we* measure on our rx
+        msg.up_loss = float(self.incoming.loss)
+        msg.ts_sent = time.time()
         self.pub.publish(msg)
         self.seq += 1
+        self.on_period()
 
-    def _on_downlink(self, msg: LinkState):
-        now = time.time()
+    def on_period(self):
+        pass
 
-        self.dn_loss.update(msg.seq)
 
-        # One-way latencies need synchronized clocks (chrony / PTP). With an offset
-        # theta: up = true_up + theta, dn = true_dn - theta. The sum (e2e) is still
-        # correct, the individual values are not. Do NOT clamp: it breaks the sum.
-        up_lat = msg.up_lat
-        dn_lat = (now - msg.ts_sent) * 1000.0
-        if up_lat < 0 or dn_lat < 0:
-            self.get_logger().warn(
-                'Negative one-way latency: clocks are not synchronized. '
-                'e2e is still valid, up/down individually are not.',
-                throttle_duration_sec=10.0,
-            )
-        self.history_up_lat.append(up_lat)
-        self.history_dn_lat.append(dn_lat)
+class NetworkServer(Peer):
+    """Bot side: measures the uplink and reports it back in its heartbeats."""
 
-        tau_up = statistics.median(self.history_up_lat)
-        tau_dn = statistics.median(self.history_dn_lat)
+    def __init__(self):
+        super().__init__('network_monitor_server', 'network_downlink', 'network_uplink')
 
-        p_up = msg.up_loss
-        p_dn = self.dn_loss.loss
-        p_e2e = p_up + p_dn - (p_up * p_dn)
-
-        # One status line every few seconds instead of prints per packet
+    def on_period(self):
         self.get_logger().info(
-            f'lat up/dn/e2e {tau_up:.1f}/{tau_dn:.1f}/{tau_up + tau_dn:.1f} ms | '
-            f'loss up/dn/e2e {p_up * 100:.1f}/{p_dn * 100:.1f}/{p_e2e * 100:.1f} %',
-            throttle_duration_sec=self.log_period,
+            f'uplink: lat {self.incoming.latency:.1f} ms | loss {self.incoming.loss * 100:.1f} %',
+            throttle_duration_sec=2.0,
         )
 
+
+class NetworkMonitor(Peer):
+    """Controller side: measures the downlink, gets the uplink from the bot.
+
+    `on_update(LinkStats)` is called every period once the bot has been heard.
+    """
+
+    def __init__(self, on_update: Callable[[LinkStats], None], send_period: float = 0.1,
+                 window: int = 100, log_period: float = 2.0, timeout: float = 0.5):
+        super().__init__('network_monitor_client', 'network_uplink', 'network_downlink',
+                         send_period, window, timeout)
+        self.on_update = on_update
+        self.log_period = log_period
+
+    def on_period(self):
+        if self.last_msg is None:
+            self.get_logger().warn('No heartbeat from the bot yet', throttle_duration_sec=5.0)
+            return
+        tau_tx, p_tx = self.last_msg.up_lat, self.last_msg.up_loss
+        tau_rx, p_rx = self.incoming.latency, self.incoming.loss
+        p_e2e = p_tx + p_rx - p_tx * p_rx
+
+        self.get_logger().info(
+            f'lat tx/rx/e2e {tau_tx:.1f}/{tau_rx:.1f}/{tau_tx + tau_rx:.1f} ms | '
+            f'loss tx/rx/e2e {p_tx * 100:.1f}/{p_rx * 100:.1f}/{p_e2e * 100:.1f} %',
+            throttle_duration_sec=self.log_period,
+        )
         self.on_update(LinkStats(
-            tau_tx=tau_up, tau_rx=tau_dn, tau_e2e=tau_up + tau_dn,
-            p_tx=p_up, p_rx=p_dn, p_e2e=p_e2e,
+            tau_tx=tau_tx, tau_rx=tau_rx, tau_e2e=tau_tx + tau_rx,
+            p_tx=p_tx, p_rx=p_rx, p_e2e=p_e2e,
         ))

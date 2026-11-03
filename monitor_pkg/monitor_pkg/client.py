@@ -1,4 +1,4 @@
-# Responder node: echoes the controller's probes back (class is called NetworkServer).
+# Bot side of the link monitor: run with `ros2 run monitor_pkg bot_monitor`.
 import rclpy
 from rclpy.executors import ExternalShutdownException
 
