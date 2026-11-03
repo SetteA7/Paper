@@ -16,50 +16,52 @@ from sensor_msgs.msg import LaserScan
 from monitor_pkg.network_link import LinkStats, NetworkMonitor
 
 
+# ============================================================== TOGGLES
+ENABLE_SMART = False    # True: adaptive threshold from network stats; False: fixed SAFE_THRESHOLD
+ENABLE_CSV = False      # True: write one CSV row per scan into CSV_DIR
+CSV_DIR = "/home/user/ros2_ws_A7"
+
+
 class LaserProcessor(Node):
-    # Hard cap for the retransmission search (prevents endless loops if p ~ 1)
-    N_MAX = 200
-    # If no scan arrives for this long, brake (lidar dead / driver crashed)
-    SCAN_TIMEOUT_NS = 500_000_000  # 0.5 s
-    # Period of the combined lidar + network status log
-    STATUS_PERIOD = 1.0  # s
+    # --- Laser ---
+    K = 100                         # samples used at the beginning/end of the array
 
-    def __init__(self):
+    # --- Robot parameters (MEASURED IN LAB) ---
+    M = 5                           # safety margin (cm)
+    BOT_LENGTH = 18.75              # bot length (cm)
+    D_BRAKE = 18.1                  # braking distance (cm)
+    VMAX = 43.77                    # max speed (cm/s)
+    T = 50                          # control period (ms)
+    SAFE_THRESHOLD = 75             # fixed brake threshold [S] (cm), used when SMART is off
+
+    # NOTE: 0.5 m/s = 50 cm/s is ABOVE VMAX (43.77 cm/s) used for the SMART
+    # threshold. Make sure the two are consistent.
+    LINEAR_SPEED = 0.5              # m/s
+
+    # --- Retransmission count N ---
+    P_TARGET = 0.05
+    MAX_LINEAR_STEPS = 4
+    N_MAX = 200                     # hard cap (prevents endless loops if p ~ 1)
+
+    # --- Timing ---
+    SCAN_TIMEOUT_NS = 500_000_000   # 0.5 s without scans -> brake (lidar dead / driver crashed)
+    STATUS_PERIOD = 1.0             # s, period of the LIDAR + NET status log
+
+    def __init__(self, smart: bool = ENABLE_SMART, log_csv: bool = ENABLE_CSV):
         super().__init__('laser_processor')
+        self.smart = smart
 
-        # --- Laser ---
-        self.k = 100                # samples used at the beginning/end of the array
-
-        # --- Robot parameters ---
-        self.m = 5                  # safety margin (cm)
-        self.bot_length = 18.75     # bot length (cm) MEASURED IN LAB
-        self.d_brake = 18.1         # braking distance (cm) MEASURED IN LAB
-        self.vmax = 43.77           # max speed (cm/s) MEASURED IN LAB
-        self.T = 50                 # control period (ms)
-        self.safe_threshold = 75    # brake threshold [S] (cm)
-
-        # --- Static configuration ---
-        # NOTE: 0.5 m/s = 50 cm/s is ABOVE vmax (43.77 cm/s) used for the SMART
-        # threshold. Make sure the two are consistent.
-        self.linear_speed = 0.5     # m/s
-        self.SMART = False
-
-        # Start braked: don't move until the first valid scan arrives
-        self.last_brake_state = True
+        # --- State ---
+        self.safe_threshold = self.SAFE_THRESHOLD
+        self.last_brake_state = True    # start braked until the first valid scan
         self.min_dist_cm = -1.0
         self.last_scan_ns = None
-        # Last scan outcome, for the status log: 'none' (no /scan ever),
-        # 'empty' (ranges array empty), 'invalid' (no value in bounds), 'ok'
-        self.scan_status = 'none'
+        self.scan_status = 'none'       # 'none' | 'empty' | 'invalid' | 'ok'
         self.scan_detail = ''
         self.link_seen = False
-
-        self.P_target = 0.05
-        self.max_linear_steps = 4
         self.current_N = 1
 
-        # --- Network variables (updated by on_link_update) ---
-        # Placeholders until the first heartbeat from the bot arrives.
+        # --- Network (placeholders until the first heartbeat from the bot) ---
         self.tau_tx = 10
         self.tau_rx = 10
         self.taue2e = self.tau_rx + self.tau_tx
@@ -67,49 +69,38 @@ class LaserProcessor(Node):
         self.p_rx = 0.05
         self.pe2e = self.p_rx + self.p_tx - (self.p_tx * self.p_rx)
 
-        # --- Pre-allocated message ---
+        # --- ROS I/O ---
         self._msg = TwistStamped()
         self._msg.header.frame_id = "base_link"
-
-        # --- Communication ---
         self.publisher_ = self.create_publisher(TwistStamped, '/cmd_vel', 10)
         self.subscription = self.create_subscription(
-            LaserScan,
-            '/scan',  # was '/scan_filtered' in an older version
-            self.scan_callback,
-            qos_profile_sensor_data,
-        )
-        self.timer = self.create_timer(0.05, self.publish_cmd)
+            LaserScan, '/scan', self.scan_callback, qos_profile_sensor_data)
+        self.timer = self.create_timer(self.T / 1000.0, self.publish_cmd)
         self.status_timer = self.create_timer(self.STATUS_PERIOD, self.log_status)
 
-        # --- CSV logging (DISABLED: set to True to re-enable) ---
-        self.log_csv = False
+        # --- CSV ---
         self.csv_file = None
         self.csv_writer = None
-        self.csv_filename = None
-        if self.log_csv:
+        if log_csv:
             self._open_csv()
+
+        self.get_logger().info(
+            f'START | SMART {"ON" if self.smart else "OFF"} | '
+            f'CSV {self.csv_file.name if self.csv_file else "OFF"} | '
+            f'speed {self.LINEAR_SPEED} m/s')
 
     # ------------------------------------------------------------------ CSV
     def _open_csv(self):
-        save_dir = "/home/user/ros2_ws_A7"
-        os.makedirs(save_dir, exist_ok=True)
+        os.makedirs(CSV_DIR, exist_ok=True)
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.csv_filename = os.path.join(save_dir, f"robot_log_{ts}.csv")
-        self.csv_file = open(self.csv_filename, mode='w', newline='')
+        self.csv_file = open(os.path.join(CSV_DIR, f"robot_log_{ts}.csv"), mode='w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
             'timestamp_ros', 'min_distance_cm', 'safe_threshold_cm', 'brake_state',
             'tau_tx_ms', 'tau_rx_ms', 'tau_e2e_ms', 'p_tx', 'p_rx', 'p_e2e'
         ])
 
-    def close_csv(self):
-        """Idempotent: safe to call even if CSV logging is disabled."""
-        if self.csv_file is not None and not self.csv_file.closed:
-            self.csv_file.flush()
-            self.csv_file.close()
-
-    def log_to_csv(self):
+    def _write_csv_row(self):
         now = self.get_clock().now().nanoseconds * 1e-9
         self.csv_writer.writerow([
             f"{now:.4f}", f"{self.min_dist_cm:.2f}", f"{self.safe_threshold:.2f}",
@@ -117,6 +108,12 @@ class LaserProcessor(Node):
             f"{self.tau_tx:.2f}", f"{self.tau_rx:.2f}", f"{self.taue2e:.2f}",
             f"{self.p_tx:.4f}", f"{self.p_rx:.4f}", f"{self.pe2e:.4f}"
         ])
+
+    def close_csv(self):
+        """Idempotent: safe to call even if CSV logging is disabled."""
+        if self.csv_file is not None and not self.csv_file.closed:
+            self.csv_file.flush()
+            self.csv_file.close()
 
     # --------------------------------------------------------------- Network
     def on_link_update(self, s: LinkStats):
@@ -132,90 +129,89 @@ class LaserProcessor(Node):
         self.update(s.p_tx, s.p_rx)
 
     # ----------------------------------------------------------------- Laser
+    def _smart_threshold(self) -> float:
+        v_cm_per_ms = self.VMAX / 1000.0
+        time_buffer = self.T * (self.current_N + 1) + self.taue2e
+        return v_cm_per_ms * time_buffer + self.BOT_LENGTH + self.M + self.D_BRAKE
+
     def scan_callback(self, msg: LaserScan):
         self.last_scan_ns = self.get_clock().now().nanoseconds
 
         # array.array -> numpy without copying the whole scan
         ranges = np.asarray(msg.ranges, dtype=np.float32)
-        zone = np.concatenate((ranges[:self.k], ranges[-self.k:]))
+        zone = np.concatenate((ranges[:self.K], ranges[-self.K:]))
         valid = zone[(zone > msg.range_min) & (zone < msg.range_max) & np.isfinite(zone)]
 
-        if self.SMART:
-            v_cm_per_ms = self.vmax / 1000.0
-            time_buffer = self.T * (self.current_N + 1) + self.taue2e
-            self.safe_threshold = (
-                v_cm_per_ms * time_buffer + self.bot_length + self.m + self.d_brake
-            )
+        if self.smart:
+            self.safe_threshold = self._smart_threshold()
 
         if valid.size > 0:
             self.scan_status = 'ok'
             self.min_dist_cm = float(valid.min()) * 100.0
             self.last_brake_state = self.min_dist_cm < self.safe_threshold
         else:
-            if zone.size == 0:
-                self.scan_status = 'empty'
-            else:
-                self.scan_status = 'invalid'
-                finite = zone[np.isfinite(zone)]
-                raw = (f'measured {finite.min():.2f}..{finite.max():.2f} m'
-                       if finite.size else 'all inf/NaN')
-                self.scan_detail = (
-                    f'{zone.size} samples, none inside [{msg.range_min:.2f}, '
-                    f'{msg.range_max:.2f}] m ({raw})'
-                )
+            self._mark_invalid_scan(zone, msg)
             self.min_dist_cm = -1.0
             self.last_brake_state = True
 
         if self.csv_writer is not None:
-            self.log_to_csv()
+            self._write_csv_row()
+
+    def _mark_invalid_scan(self, zone: np.ndarray, msg: LaserScan):
+        if zone.size == 0:
+            self.scan_status = 'empty'
+            return
+        self.scan_status = 'invalid'
+        finite = zone[np.isfinite(zone)]
+        raw = (f'measured {finite.min():.2f}..{finite.max():.2f} m'
+               if finite.size else 'all inf/NaN')
+        self.scan_detail = (f'{zone.size} samples, none inside '
+                            f'[{msg.range_min:.2f}, {msg.range_max:.2f}] m ({raw})')
+
+    def _scan_stale(self, now_ns: int) -> bool:
+        return self.last_scan_ns is None or (now_ns - self.last_scan_ns) > self.SCAN_TIMEOUT_NS
 
     # ---------------------------------------------------------------- Status
     def log_status(self):
         """One LIDAR line + one NET line. Yellow = lidar problem, red = no /scan at all."""
         log = self.get_logger()
+        now_ns = self.get_clock().now().nanoseconds
 
         if self.scan_status == 'none':
-            log.error('LIDAR | NO DATA: nothing ever received on /scan '
-                      '(topic missing or lidar driver not running) | BRAKE')
+            log.error('LIDAR | NO DATA on /scan (topic missing or driver not running) | BRAKE')
+        elif self._scan_stale(now_ns):
+            age = (now_ns - self.last_scan_ns) * 1e-9
+            log.warn(f'LIDAR | STALE: last scan {age:.1f} s ago | BRAKE')
+        elif self.scan_status == 'empty':
+            log.warn('LIDAR | EMPTY scan (ranges array is empty) | BRAKE')
+        elif self.scan_status == 'invalid':
+            log.warn(f'LIDAR | NO VALID reading: {self.scan_detail} | BRAKE')
         else:
-            age = (self.get_clock().now().nanoseconds - self.last_scan_ns) * 1e-9
-            if age * 1e9 > self.SCAN_TIMEOUT_NS:
-                log.warn(f'LIDAR | STALE: last scan {age:.1f} s ago (lidar stopped?) | BRAKE')
-            elif self.scan_status == 'empty':
-                log.warn('LIDAR | EMPTY scan: ranges array is empty (lidar not working) | BRAKE')
-            elif self.scan_status == 'invalid':
-                log.warn(f'LIDAR | NO VALID reading: {self.scan_detail} | BRAKE')
-            else:
-                state = 'BRAKE' if self.last_brake_state else 'GO'
-                log.info(f'LIDAR | min {self.min_dist_cm:6.1f} cm | '
-                         f'threshold {self.safe_threshold:5.1f} cm | {state}')
+            state = 'BRAKE' if self.last_brake_state else 'GO'
+            mode = 'smart' if self.smart else 'fixed'
+            log.info(f'LIDAR | min {self.min_dist_cm:6.1f} cm | '
+                     f'thr {self.safe_threshold:5.1f} cm ({mode}) | {state}')
 
         if not self.link_seen:
             log.warn('NET   | no heartbeat from the bot yet')
         else:
-            log.info(
-                f'NET   | latency tx {self.tau_tx:5.1f}  rx {self.tau_rx:5.1f}  '
-                f'e2e {self.taue2e:5.1f} ms | loss tx {self.p_tx * 100:5.1f}%  '
-                f'rx {self.p_rx * 100:5.1f}%  e2e {self.pe2e * 100:5.1f}% | N={self.current_N}'
-            )
+            log.info(f'NET   | tau tx {self.tau_tx:5.1f} rx {self.tau_rx:5.1f} '
+                     f'e2e {self.taue2e:5.1f} ms | '
+                     f'p tx {self.p_tx * 100:4.1f}% rx {self.p_rx * 100:4.1f}% '
+                     f'e2e {self.pe2e * 100:4.1f}% | N={self.current_N}')
+
+    # --------------------------------------------------------------- Command
+    def _publish_speed(self, speed: float):
+        self._msg.header.stamp = self.get_clock().now().to_msg()
+        self._msg.twist.linear.x = speed
+        self.publisher_.publish(self._msg)
 
     def publish_cmd(self):
-        now = self.get_clock().now()
-        stale = (
-            self.last_scan_ns is None
-            or (now.nanoseconds - self.last_scan_ns) > self.SCAN_TIMEOUT_NS
-        )
-        brake = self.last_brake_state or stale
-
-        self._msg.header.stamp = now.to_msg()
-        self._msg.twist.linear.x = 0.0 if brake else self.linear_speed
-        self.publisher_.publish(self._msg)
+        brake = self.last_brake_state or self._scan_stale(self.get_clock().now().nanoseconds)
+        self._publish_speed(0.0 if brake else self.LINEAR_SPEED)
 
     def stop_robot(self):
-        self._msg.header.stamp = self.get_clock().now().to_msg()
-        self._msg.twist.linear.x = 0.0
-        self.publisher_.publish(self._msg)
-        self.close_csv()
+        self._publish_speed(0.0)
 
     # ------------------------------------------------- Retransmission count N
     def _calculate_P_N(self, N: int, p_tx: float, p_rx: float) -> float:
@@ -228,7 +224,7 @@ class LaserProcessor(Node):
     def _binary_search_fallback(self, p_tx: float, p_rx: float) -> int:
         # 1. Exponential bounding (bounded by N_MAX)
         high = 1
-        while high < self.N_MAX and self._calculate_P_N(high, p_tx, p_rx) > self.P_target:
+        while high < self.N_MAX and self._calculate_P_N(high, p_tx, p_rx) > self.P_TARGET:
             high *= 2
         high = min(high, self.N_MAX)
 
@@ -240,7 +236,7 @@ class LaserProcessor(Node):
         search_domain = range(low, high + 1)
         index = bisect.bisect_left(
             search_domain,
-            -self.P_target,
+            -self.P_TARGET,
             key=lambda n: -self._calculate_P_N(n, p_tx, p_rx),
         )
         if index >= len(search_domain):
@@ -251,20 +247,20 @@ class LaserProcessor(Node):
         temp_N = self.current_N
         steps = 0
 
-        if self._calculate_P_N(temp_N, p_tx, p_rx) > self.P_target:
+        if self._calculate_P_N(temp_N, p_tx, p_rx) > self.P_TARGET:
             # Current N too weak
-            while self._calculate_P_N(temp_N, p_tx, p_rx) > self.P_target:
+            while self._calculate_P_N(temp_N, p_tx, p_rx) > self.P_TARGET:
                 temp_N += 1
                 steps += 1
-                if steps > self.max_linear_steps:
+                if steps > self.MAX_LINEAR_STEPS:
                     self.current_N = self._binary_search_fallback(p_tx, p_rx)
                     return self.current_N
         else:
             # Current N strong enough: can we go lower?
-            while temp_N > 1 and self._calculate_P_N(temp_N - 1, p_tx, p_rx) <= self.P_target:
+            while temp_N > 1 and self._calculate_P_N(temp_N - 1, p_tx, p_rx) <= self.P_TARGET:
                 temp_N -= 1
                 steps += 1
-                if steps > self.max_linear_steps:
+                if steps > self.MAX_LINEAR_STEPS:
                     self.current_N = self._binary_search_fallback(p_tx, p_rx)
                     return self.current_N
 
