@@ -16,15 +16,21 @@ from rclpy.utilities import remove_ros_args
 from geometry_msgs.msg import TwistStamped
 from sensor_msgs.msg import LaserScan
 
+from monitor_pkg import crash_model
 from monitor_pkg.network_link import LinkStats, NetworkMonitor
 
 
 # ============================================================== TOGGLES
-# Defaults; override at launch: ros2 run monitor_pkg controller_monitor SMART NOCSV
+# Defaults; override at launch: ros2 run monitor_pkg controller_monitor SUPERSMART NOCSV
 # Automated test: ros2 run monitor_pkg controller_monitor SMART RUNS=20  (see AutoTest)
 # Old open-ended mode (drive/brake until Ctrl+C, no return): ... controller_monitor MANUAL
 DEFAULT_RUNS = 1        # runs when RUNS= is not given (each run returns to the start)
-ENABLE_SMART = False    # True: adaptive threshold from network stats; False: fixed SAFE_THRESHOLD
+# Threshold mode (flags FIXED | SMART | SUPERSMART):
+#   FIXED       S = SAFE_THRESHOLD
+#   SMART       S_high: budget T*(N*+1), safe for any waits (conservative)
+#   SUPERSMART  S_smart: budget B_min, lowest S with exact P_crash <= P_TARGET
+DEFAULT_MODE = 'FIXED'
+MODES = ('FIXED', 'SMART', 'SUPERSMART')
 ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
 CSV_DIR = "/home/user/ros2_ws_A7/csv"
 
@@ -65,9 +71,12 @@ class LaserProcessor(Node):
     RETURN_TIMEOUT_S = 30.0         # abort if the start position is not reached in time
     REAR_STOP_CM = 30.0             # abort reversing if anything is this close behind the lidar
 
-    def __init__(self, smart: bool = ENABLE_SMART, log_csv: bool = ENABLE_CSV, runs: int = 0):
+    def __init__(self, mode: str = DEFAULT_MODE, log_csv: bool = ENABLE_CSV, runs: int = 0):
         super().__init__('laser_processor')
-        self.smart = smart
+        self.mode = mode
+        self.budget_ms = 0.0            # B = dt - tau_e2e for the current threshold
+        self.p_crash = 1.0              # exact crash probability at the current threshold
+        self.target_reached = True      # SUPERSMART: False if P_TARGET is unreachable
 
         # --- State ---
         self.safe_threshold = self.SAFE_THRESHOLD
@@ -108,7 +117,7 @@ class LaserProcessor(Node):
             self._open_csv()
 
         self.get_logger().info(
-            f'START | SMART {"ON" if self.smart else "OFF"} | '
+            f'START | mode {self.mode} | '
             f'CSV {self.csv_file.name if self.csv_file else "OFF"} | '
             f'speed {self.LINEAR_SPEED} m/s'
             + (f' | AUTO {runs} runs -> {self.auto.session_dir}' if self.auto else ''))
@@ -127,7 +136,8 @@ class LaserProcessor(Node):
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
             'timestamp_lidar', 'timestamp_arrival', 'scan_delay_ms', 'min_distance_cm', 'safe_threshold_cm', 'brake_state',
-            'tau_tx_ms', 'tau_rx_ms', 'tau_e2e_ms', 'p_tx', 'p_rx', 'p_e2e'
+            'tau_tx_ms', 'tau_rx_ms', 'tau_e2e_ms', 'p_tx', 'p_rx', 'p_e2e',
+            'budget_ms', 'p_crash'
         ])
 
     def _write_csv_row(self, lidar_ns: int, arrival_ns: int):
@@ -139,7 +149,8 @@ class LaserProcessor(Node):
             f"{(arrival_ns - lidar_ns) * 1e-6:.2f}", f"{self.min_dist_cm:.2f}", f"{self.safe_threshold:.2f}",
             int(self.last_brake_state),
             f"{self.tau_tx:.2f}", f"{self.tau_rx:.2f}", f"{self.taue2e:.2f}",
-            f"{self.p_tx:.4f}", f"{self.p_rx:.4f}", f"{self.pe2e:.4f}"
+            f"{self.p_tx:.4f}", f"{self.p_rx:.4f}", f"{self.pe2e:.4f}",
+            f"{self.budget_ms:.2f}", f"{self.p_crash:.6f}"
         ])
 
     def close_csv_run(self):
@@ -177,6 +188,23 @@ class LaserProcessor(Node):
         time_buffer = self.T * (self.current_N + 1) + self.taue2e
         return v_cm_per_ms * time_buffer + self.BOT_LENGTH + self.M + self.D_BRAKE
 
+    def _supersmart_threshold(self) -> float:
+        """S_smart = vmax/1000 * (B_min + tau_e2e) + L + m + d_brake (thesis 4.7)."""
+        B, self.target_reached = crash_model.b_min(
+            self.T, self.p_tx, self.p_rx, self.P_TARGET, self.N_MAX)
+        return crash_model.threshold_from_budget(
+            B, self.taue2e, self.VMAX, self.BOT_LENGTH + self.M + self.D_BRAKE)
+
+    def _update_threshold(self):
+        """Threshold for the current mode, plus the exact P_crash it gives (all modes)."""
+        if self.mode == 'SMART':
+            self.safe_threshold = self._smart_threshold()
+        elif self.mode == 'SUPERSMART':
+            self.safe_threshold = self._supersmart_threshold()
+        self.budget_ms = crash_model.budget_from_threshold(
+            self.safe_threshold, self.taue2e, self.VMAX, self.BOT_LENGTH + self.M + self.D_BRAKE)
+        self.p_crash = crash_model.p_crash(self.budget_ms, self.T, self.p_tx, self.p_rx)
+
     def scan_callback(self, msg: LaserScan):
         arrival_ns = self.get_clock().now().nanoseconds
         self.last_scan_ns = arrival_ns
@@ -186,8 +214,7 @@ class LaserProcessor(Node):
         zone = np.concatenate((ranges[:self.K], ranges[-self.K:]))
         valid = zone[(zone > msg.range_min) & (zone < msg.range_max) & np.isfinite(zone)]
 
-        if self.smart:
-            self.safe_threshold = self._smart_threshold()
+        self._update_threshold()
 
         if valid.size > 0:
             self.scan_status = 'ok'
@@ -239,9 +266,14 @@ class LaserProcessor(Node):
         return self.last_brake_state, f'{self.min_dist_cm:.1f} {op} {self.safe_threshold:.1f} cm'
 
     def _mode_str(self) -> str:
-        if self.smart:
-            return f'SMART thr {self.safe_threshold:5.1f} cm (N={self.current_N})'
-        return f'FIXED thr {self.safe_threshold:5.1f} cm'
+        pc = f'Pcrash {self.p_crash:.4f}'
+        if self.mode == 'SMART':
+            return f'SMART thr {self.safe_threshold:5.1f} cm (N={self.current_N}, {pc})'
+        if self.mode == 'SUPERSMART':
+            warn = '' if self.target_reached else ', TARGET UNREACHABLE'
+            return (f'SUPERSMART thr {self.safe_threshold:5.1f} cm '
+                    f'(B={self.budget_ms:.0f} ms, {pc}{warn})')
+        return f'FIXED thr {self.safe_threshold:5.1f} cm ({pc})'
 
     # ---------------------------------------------------------------- Status
     def log_status(self):
@@ -390,7 +422,8 @@ class AutoTest:
     SUMMARY_HEADER = [
         'run', 'csv_file', 'start_dist_cm', 'brake_dist_cm', 'safe_threshold_cm', 'N_at_brake',
         'tau_e2e_ms_at_brake', 'p_e2e_at_brake', 'final_dist_cm', 'min_dist_cm',
-        'stop_distance_cm', 'margin_to_crash_cm', 'crashed',
+        'stop_distance_cm', 'margin_to_crash_cm', 'crashed', 'mode', 'budget_ms_at_brake',
+        'p_crash_at_brake',
     ]
 
     def __init__(self, node: 'LaserProcessor', runs: int):
@@ -404,7 +437,7 @@ class AutoTest:
         self.results = []               # (run, final_dist, crashed)
         self._enter('wait')
 
-        mode = 'SMART' if node.smart else 'FIXED'
+        mode = node.mode
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.session_dir = os.path.join(CSV_DIR, f'auto_{mode}_{ts}')
         os.makedirs(self.session_dir, exist_ok=True)
@@ -490,6 +523,7 @@ class AutoTest:
         # Only a distance-based brake ends the run; stale/invalid scans just pause it
         if brake and n.scan_fresh_ok() and n.last_brake_state:
             self.brake = dict(dist=n.min_dist_cm, thr=n.safe_threshold, N=n.current_N,
+                              B=n.budget_ms, pc=n.p_crash,
                               tau=n.taue2e, p=n.pe2e)
             self._log().info(f'AUTO | run {self.run} braked ({reason})')
             self._enter('stopping')
@@ -507,6 +541,7 @@ class AutoTest:
             f'{b["dist"]:.2f}', f'{b["thr"]:.2f}', b['N'], f'{b["tau"]:.2f}', f'{b["p"]:.4f}',
             f'{final:.2f}', f'{self.run_min:.2f}', f'{b["dist"] - final:.2f}',
             f'{self.run_min - self.node.CRASH_DIST_CM:.2f}', int(crashed),
+            n.mode, f'{b["B"]:.2f}', f'{b["pc"]:.6f}',
         ])
         self.summary_file.flush()
         n.close_csv_run()
@@ -547,8 +582,9 @@ def parse_flags(argv):
     """Command-line toggles, e.g. `ros2 run monitor_pkg controller_monitor SMART NOCSV`.
     `RUNS=n` runs the automated test (AutoTest) n times (default DEFAULT_RUNS).
     `MANUAL` = old open-ended mode: no runs, no return, until Ctrl+C.
-    Anything not given falls back to ENABLE_SMART / ENABLE_CSV."""
-    smart, log_csv, runs = ENABLE_SMART, ENABLE_CSV, DEFAULT_RUNS
+    FIXED | SMART | SUPERSMART pick the threshold mode (NOSMART = FIXED).
+    Anything not given falls back to DEFAULT_MODE / ENABLE_CSV."""
+    mode, log_csv, runs = DEFAULT_MODE, ENABLE_CSV, DEFAULT_RUNS
     for arg in argv:
         flag = arg.upper()
         if flag == 'MANUAL':
@@ -560,26 +596,27 @@ def parse_flags(argv):
                 raise SystemExit(f"Bad option '{arg}': use RUNS=<number>")
             if runs < 1:
                 raise SystemExit('RUNS must be >= 1')
-        elif flag == 'SMART':
-            smart = True
+        elif flag in MODES:
+            mode = flag
         elif flag == 'NOSMART':
-            smart = False
+            mode = 'FIXED'
         elif flag == 'CSV':
             log_csv = True
         elif flag == 'NOCSV':
             log_csv = False
         else:
             raise SystemExit(
-                f"Unknown option '{arg}'. Use: SMART | NOSMART | CSV | NOCSV | RUNS=<n> | MANUAL")
-    return smart, log_csv, runs
+                f"Unknown option '{arg}'. Use: FIXED | SMART | SUPERSMART | CSV | NOCSV "
+                "| RUNS=<n> | MANUAL")
+    return mode, log_csv, runs
 
 
 def main(args=None):
     # Strip --ros-args ... so only our own flags are left
-    smart, log_csv, runs = parse_flags(remove_ros_args(args=sys.argv)[1:])
+    mode, log_csv, runs = parse_flags(remove_ros_args(args=sys.argv)[1:])
     rclpy.init(args=args)
 
-    laser_node = LaserProcessor(smart=smart, log_csv=log_csv, runs=runs)
+    laser_node = LaserProcessor(mode=mode, log_csv=log_csv, runs=runs)
     # log_period=None: the controller logs the network stats in log_status()
     network_node = NetworkMonitor(on_update=laser_node.on_link_update, log_period=None)
 
