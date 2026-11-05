@@ -44,7 +44,7 @@ class LaserProcessor(Node):
     # --- Retransmission count N ---
     P_TARGET = 0.05
     MAX_LINEAR_STEPS = 4
-    N_MAX = 200                     # hard cap (prevents endless loops if p ~ 1)
+    N_MAX = 20000                     # hard cap (prevents endless loops if p ~ 1) (was 200)
 
     # --- Timing ---
     SCAN_TIMEOUT_NS = 500_000_000   # 0.5 s without scans -> brake (lidar dead / driver crashed)
