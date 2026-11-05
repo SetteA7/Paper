@@ -32,6 +32,12 @@ DEFAULT_RUNS = 1        # runs when RUNS= is not given (each run returns to the 
 DEFAULT_MODE = 'FIXED'
 MODES = ('FIXED', 'SMART', 'SUPERSMART')
 ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
+# Downlink latency tau_rx (bot -> controller):
+#   True:  from the network ping (heartbeat one-way latency, median of the last 100)
+#   False: from the LiDAR scans: arrival time - header.stamp, median of the last
+#          SCAN_TAU_WINDOW scans (includes driver + middleware delay of the real data)
+# Loss p_rx and the uplink tau_tx always come from the ping.
+usePingTauRX = False
 CSV_DIR = "/home/user/ros2_ws_A7/csv"
 
 
@@ -59,6 +65,7 @@ class LaserProcessor(Node):
     # --- Timing ---
     SCAN_TIMEOUT_NS = 500_000_000   # 0.5 s without scans -> brake (lidar dead / driver crashed)
     STATUS_PERIOD = 1.0             # s, period of the LIDAR + NET status log
+    SCAN_TAU_WINDOW = 100           # scans in the median for tau_rx when usePingTauRX = False
 
     # --- AUTO test mode (RUNS=n on the command line, see AutoTest) ---
     CRASH_DIST_CM = BOT_LENGTH      # lidar reading at/below this = crash (lidar -> front bumper)
@@ -90,6 +97,7 @@ class LaserProcessor(Node):
         self._last_sent_brake = None    # last command sent, to log only on changes
         self.rear_min_cm = float('inf')  # closest object behind (for reversing in AUTO mode)
         self.recent_dists = deque(maxlen=5)  # last valid front distances (cm), for medians
+        self.scan_delays = deque(maxlen=self.SCAN_TAU_WINDOW)  # ms, arrival - header.stamp
 
         # --- Network (placeholders until the first heartbeat from the bot) ---
         self.tau_tx = 10
@@ -117,7 +125,7 @@ class LaserProcessor(Node):
             self._open_csv()
 
         self.get_logger().info(
-            f'START | mode {self.mode} | '
+            f'START | mode {self.mode} | tau_rx from {"PING" if usePingTauRX else "LIDAR"} | '
             f'CSV {self.csv_file.name if self.csv_file else "OFF"} | '
             f'speed {self.LINEAR_SPEED} m/s'
             + (f' | AUTO {runs} runs -> {self.auto.session_dir}' if self.auto else ''))
@@ -179,7 +187,10 @@ class LaserProcessor(Node):
         """
         self.link_seen = True
         self.p_tx, self.p_rx, self.pe2e = s.p_tx, s.p_rx, s.p_e2e
-        self.tau_tx, self.tau_rx, self.taue2e = s.tau_tx, s.tau_rx, s.tau_e2e
+        self.tau_tx = s.tau_tx
+        if usePingTauRX:
+            self.tau_rx = s.tau_rx
+        self.taue2e = self.tau_tx + self.tau_rx
         self.update(s.p_tx, s.p_rx)
 
     # ----------------------------------------------------------------- Laser
@@ -208,6 +219,12 @@ class LaserProcessor(Node):
     def scan_callback(self, msg: LaserScan):
         arrival_ns = self.get_clock().now().nanoseconds
         self.last_scan_ns = arrival_ns
+        lidar_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        if not usePingTauRX:
+            # Downlink latency measured on the real sensor data (needs synced clocks)
+            self.scan_delays.append((arrival_ns - lidar_ns) * 1e-6)
+            self.tau_rx = float(np.median(self.scan_delays))
+            self.taue2e = self.tau_tx + self.tau_rx
 
         # array.array -> numpy without copying the whole scan
         ranges = np.asarray(msg.ranges, dtype=np.float32)
@@ -236,7 +253,6 @@ class LaserProcessor(Node):
             self.auto.on_scan()
 
         if self.csv_writer is not None:
-            lidar_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
             self._write_csv_row(lidar_ns, arrival_ns)
 
     def _mark_invalid_scan(self, zone: np.ndarray, msg: LaserScan):
