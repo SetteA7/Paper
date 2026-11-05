@@ -21,7 +21,7 @@ from monitor_pkg.network_link import LinkStats, NetworkMonitor
 # ============================================================== TOGGLES
 # Defaults; override at launch: ros2 run monitor_pkg controller_monitor SMART NOCSV
 ENABLE_SMART = False    # True: adaptive threshold from network stats; False: fixed SAFE_THRESHOLD
-ENABLE_CSV = False      # True: write one CSV row per scan into CSV_DIR
+ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
 CSV_DIR = "/home/user/ros2_ws_A7"
 
 
@@ -34,9 +34,7 @@ class LaserProcessor(Node):
     BOT_LENGTH = 18.75              # bot length (cm)
     D_BRAKE = 18.1                  # braking distance (cm)
     VMAX = 43.77                    # max speed (cm/s)
-    T_INIT = 50.0                   # control period placeholder (ms) until scans arrive;
-                                    # T then tracks the measured LiDAR period (1 cmd per scan)
-    T_ALPHA = 0.1                   # EMA weight for the measured scan period
+    T = 50                          # control period (ms)
     SAFE_THRESHOLD = 75             # fixed brake threshold [S] (cm), used when SMART is off
 
     # NOTE: 0.5 m/s = 50 cm/s is ABOVE VMAX (43.77 cm/s) used for the SMART
@@ -50,7 +48,6 @@ class LaserProcessor(Node):
 
     # --- Timing ---
     SCAN_TIMEOUT_NS = 500_000_000   # 0.5 s without scans -> brake (lidar dead / driver crashed)
-    WATCHDOG_PERIOD = 0.1           # s, brake check when no scans arrive (no scan -> no cmd otherwise)
     STATUS_PERIOD = 1.0             # s, period of the LIDAR + NET status log
 
     def __init__(self, smart: bool = ENABLE_SMART, log_csv: bool = ENABLE_CSV):
@@ -62,7 +59,6 @@ class LaserProcessor(Node):
         self.last_brake_state = True    # start braked until the first valid scan
         self.min_dist_cm = -1.0
         self.last_scan_ns = None
-        self.T = self.T_INIT            # control period (ms) = LiDAR period, measured
         self.scan_status = 'none'       # 'none' | 'empty' | 'invalid' | 'ok'
         self.scan_detail = ''
         self.link_seen = False
@@ -83,9 +79,7 @@ class LaserProcessor(Node):
         self.publisher_ = self.create_publisher(TwistStamped, '/cmd_vel', 10)
         self.subscription = self.create_subscription(
             LaserScan, '/scan', self.scan_callback, qos_profile_sensor_data)
-        # Control loop is driven by /scan: one command per scan, so T = LiDAR period.
-        # The watchdog only brakes when scans stop arriving.
-        self.watchdog_timer = self.create_timer(self.WATCHDOG_PERIOD, self.watchdog)
+        self.timer = self.create_timer(self.T / 1000.0, self.publish_cmd)
         self.status_timer = self.create_timer(self.STATUS_PERIOD, self.log_status)
 
         # --- CSV ---
@@ -144,21 +138,8 @@ class LaserProcessor(Node):
         time_buffer = self.T * (self.current_N + 1) + self.taue2e
         return v_cm_per_ms * time_buffer + self.BOT_LENGTH + self.M + self.D_BRAKE
 
-    def _update_period(self, now_ns: int, msg: LaserScan):
-        """T (ms) = LiDAR period: EMA of scan inter-arrival times.
-        Seeded from msg.scan_time when the driver fills it."""
-        if self.last_scan_ns is None:
-            if msg.scan_time > 0.0:
-                self.T = msg.scan_time * 1000.0
-            return
-        dt_ms = (now_ns - self.last_scan_ns) * 1e-6
-        if 0.0 < dt_ms < self.SCAN_TIMEOUT_NS * 1e-6:   # skip gaps (lidar restart)
-            self.T += self.T_ALPHA * (dt_ms - self.T)
-
     def scan_callback(self, msg: LaserScan):
-        now_ns = self.get_clock().now().nanoseconds
-        self._update_period(now_ns, msg)
-        self.last_scan_ns = now_ns
+        self.last_scan_ns = self.get_clock().now().nanoseconds
 
         # array.array -> numpy without copying the whole scan
         ranges = np.asarray(msg.ranges, dtype=np.float32)
@@ -179,9 +160,6 @@ class LaserProcessor(Node):
 
         if self.csv_writer is not None:
             self._write_csv_row()
-
-        # Control step: send the command right away, at the LiDAR rate
-        self.publish_cmd()
 
     def _mark_invalid_scan(self, zone: np.ndarray, msg: LaserScan):
         if zone.size == 0:
@@ -239,8 +217,7 @@ class LaserProcessor(Node):
         elif self.scan_status == 'invalid':
             log.warn(f'DIST     | NO VALID reading: {self.scan_detail}')
         else:
-            log.info(f'DIST     | min {self.min_dist_cm:6.1f} cm | '
-                     f'T {self.T:5.1f} ms ({1000.0 / self.T:4.1f} Hz)')
+            log.info(f'DIST     | min {self.min_dist_cm:6.1f} cm')
 
         # 3. Decision
         brake, reason = self._decision(now_ns)
@@ -264,11 +241,6 @@ class LaserProcessor(Node):
                 self.get_logger().warn(f'>>> BRAKE sent | {self._mode_str()} | {reason}')
             else:
                 self.get_logger().info(f'>>> SAFE, moving | {self._mode_str()} | {reason}')
-
-    def watchdog(self):
-        """Commands are sent from scan_callback; if scans stop, keep sending brake."""
-        if self._scan_stale(self.get_clock().now().nanoseconds):
-            self.publish_cmd()
 
     def stop_robot(self):
         self._publish_speed(0.0)
