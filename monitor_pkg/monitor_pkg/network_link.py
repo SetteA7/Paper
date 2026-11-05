@@ -57,18 +57,30 @@ class Direction:
         self.expected = None                   # next seq we expect
         self.last_rx = time.time()
 
-    def on_packet(self, seq: int, ts_sent: float, now: float):
+    def reset(self):
+        """Forget all history (used when the other end restarts)."""
+        self.received.clear()
+        self.latencies.clear()
+        self.expected = None
+
+    def on_packet(self, seq: int, ts_sent: float, now: float) -> bool:
+        """Returns True if the sender restarted (stats were reset)."""
         restarted = self.expected is not None and seq < self.expected and (
             seq == 0 or self.expected - seq > self.window)
-        if self.expected is None or restarted:
+        if restarted:
+            # New session: drop the losses counted while the sender was down,
+            # so stats start from zero instead of from ~100% loss.
+            self.reset()
+        if self.expected is None:
             self.expected = seq                # first packet / sender restarted
         elif seq < self.expected:
-            return                             # late or duplicate: already counted lost
+            return False                       # late or duplicate: already counted lost
         self.received.extend([0] * min(seq - self.expected, self.window))
         self.received.append(1)
         self.expected = seq + 1
         self.last_rx = now
         self.latencies.append((now - ts_sent) * 1000.0)
+        return restarted
 
     def on_tick(self, now: float):
         """Call once per period: counts a lost packet while the link is silent."""
@@ -114,7 +126,8 @@ class Peer(Node):
         self.seq = 0
 
     def _on_msg(self, msg: LinkState):
-        self.incoming.on_packet(msg.seq, msg.ts_sent, time.time())
+        if self.incoming.on_packet(msg.seq, msg.ts_sent, time.time()):
+            self.get_logger().info('Other end restarted: link stats reset')
         self.last_msg = msg
 
     def _on_timer(self):
