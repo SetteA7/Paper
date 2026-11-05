@@ -80,7 +80,8 @@ class LaserProcessor(Node):
 
     # --- Alignment before each AUTO run: turn in place until perpendicular to the wall ---
     ALIGN_ENABLED = True
-    ALIGN_FIT_DEG = 20.0            # fit the wall line on points within +/- this of straight ahead
+    ALIGN_FIT_DEG = 30.0            # max half-width of the fitted wall segment (deg)
+    ALIGN_JUMP_CM = 5.0             # range jump between neighbours = edge of the surface
     ALIGN_TOL_DEG = 0.5             # aligned when |yaw error| <= this
     ALIGN_KP = 1.5                  # (rad/s) per rad of yaw error
     ALIGN_MAX_W = 0.4               # rad/s, max turn speed
@@ -275,29 +276,46 @@ class LaserProcessor(Node):
             self._write_csv_row(lidar_ns, arrival_ns)
 
     def _fit_wall_yaw(self, ranges: np.ndarray, msg: LaserScan) -> float | None:
-        """Yaw error (rad) between the robot heading and the normal of the wall ahead.
+        """Yaw error (rad) between the robot heading and the normal of the surface ahead.
 
-        Index 0 of the scan is straight ahead (same convention as the front sector),
-        so the robot-frame angle of sample i is i * angle_increment (wrapped).
-        Fits the wall as x = a + b*y (x forward, y left); perpendicular when b = 0.
-        Wall rotated by alpha (robot must turn +alpha, i.e. left): b = -tan(alpha).
+        Index 0 of the scan is straight ahead and the end of the array wraps around to
+        it (same convention as the front sector), so sample i is at angle i*inc for the
+        start of the array and (i - n)*inc for the end.
+        Only the surface the bot faces is used: starting straight ahead, the segment is
+        grown in both directions until a range jump > ALIGN_JUMP_CM (its edge) or
+        ALIGN_FIT_DEG. Points beyond the edges (things further away) would wreck the fit.
+        Fits x = a + b*y (x forward, y left); perpendicular when b = 0.
+        Surface rotated by alpha (robot must turn +alpha): b = -tan(alpha).
         """
         n = ranges.size
-        if n == 0:
+        inc = abs(msg.angle_increment)
+        if n < 20 or inc <= 0:
             return None
-        th = np.arange(n) * msg.angle_increment
-        th = np.arctan2(np.sin(th), np.cos(th))
-        m = ((np.abs(th) <= np.radians(self.ALIGN_FIT_DEG)) & np.isfinite(ranges)
-             & (ranges > msg.range_min) & (ranges < msg.range_max))
-        if m.sum() < 10:
+        k = min(int(np.radians(self.ALIGN_FIT_DEG) / inc), n // 2 - 1)
+        idx = np.r_[n - k:n, 0:k + 1]               # ordered: -k .. 0 .. +k
+        r = ranges[idx].astype(np.float64)
+        ok = np.isfinite(r) & (r > msg.range_min) & (r < msg.range_max)
+        c = k                                       # position of straight ahead
+        if not ok[c]:
             return None
-        x = ranges[m] * np.cos(th[m])
-        y = ranges[m] * np.sin(th[m])
+        jump = self.ALIGN_JUMP_CM / 100.0
+        lo = c
+        while lo > 0 and ok[lo - 1] and abs(r[lo - 1] - r[lo]) <= jump:
+            lo -= 1
+        hi = c
+        while hi < 2 * k and ok[hi + 1] and abs(r[hi + 1] - r[hi]) <= jump:
+            hi += 1
+        if hi - lo + 1 < 20:
+            return None
+        th = (np.arange(lo, hi + 1) - c) * msg.angle_increment
+        rr = r[lo:hi + 1]
+        x = rr * np.cos(th)
+        y = rr * np.sin(th)
         b, a = np.polyfit(y, x, 1)
-        # one pass of outlier rejection (objects in front of the wall, noise)
+        # one pass of outlier rejection (noise, small objects on the surface)
         res = np.abs(x - (a + b * y))
         keep = res <= max(3.0 * float(np.median(res)), 0.01)
-        if keep.sum() < 10:
+        if keep.sum() < 20:
             return None
         b, a = np.polyfit(y[keep], x[keep], 1)
         return float(-np.arctan(b))
