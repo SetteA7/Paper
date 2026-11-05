@@ -78,6 +78,18 @@ class LaserProcessor(Node):
     RETURN_TIMEOUT_S = 30.0         # abort if the start position is not reached in time
     REAR_STOP_CM = 30.0             # abort reversing if anything is this close behind the lidar
 
+    # --- Alignment before each AUTO run: turn in place until perpendicular to the wall ---
+    ALIGN_ENABLED = True
+    ALIGN_FIT_DEG = 20.0            # fit the wall line on points within +/- this of straight ahead
+    ALIGN_TOL_DEG = 0.5             # aligned when |yaw error| <= this
+    ALIGN_KP = 1.5                  # (rad/s) per rad of yaw error
+    ALIGN_MAX_W = 0.4               # rad/s, max turn speed
+    ALIGN_MIN_W = 0.05              # rad/s, slowest turn (below this the bot may not turn)
+    ALIGN_SETTLE_S = 0.6            # standstill re-check: error must stay within tolerance
+    ALIGN_TIMEOUT_S = 30.0          # abort the session if not aligned in time
+    ALIGN_MAX_DEG = 15.0            # abort if the error grows past this (turning the wrong way?)
+    ALIGN_SIGN = 1                  # set to -1 if the bot turns AWAY from perpendicular
+
     def __init__(self, mode: str = DEFAULT_MODE, log_csv: bool = ENABLE_CSV, runs: int = 0):
         super().__init__('laser_processor')
         self.mode = mode
@@ -98,6 +110,8 @@ class LaserProcessor(Node):
         self.rear_min_cm = float('inf')  # closest object behind (for reversing in AUTO mode)
         self.recent_dists = deque(maxlen=5)  # last valid front distances (cm), for medians
         self.scan_delays = deque(maxlen=self.SCAN_TAU_WINDOW)  # ms, arrival - header.stamp
+        self.wall_yaw = None            # rad, yaw error w.r.t. the wall normal (+ = turn left)
+        self.recent_yaws = deque(maxlen=3)
 
         # --- Network (placeholders until the first heartbeat from the bot) ---
         self.tau_tx = 10
@@ -249,11 +263,44 @@ class LaserProcessor(Node):
         rear = rear[(rear > msg.range_min) & (rear < msg.range_max) & np.isfinite(rear)]
         self.rear_min_cm = float(rear.min()) * 100.0 if rear.size else float('inf')
 
+        if self.auto is not None and self.ALIGN_ENABLED:
+            self.wall_yaw = self._fit_wall_yaw(ranges, msg)
+            if self.wall_yaw is not None:
+                self.recent_yaws.append(self.wall_yaw)
+
         if self.auto is not None:
             self.auto.on_scan()
 
         if self.csv_writer is not None:
             self._write_csv_row(lidar_ns, arrival_ns)
+
+    def _fit_wall_yaw(self, ranges: np.ndarray, msg: LaserScan) -> float | None:
+        """Yaw error (rad) between the robot heading and the normal of the wall ahead.
+
+        Index 0 of the scan is straight ahead (same convention as the front sector),
+        so the robot-frame angle of sample i is i * angle_increment (wrapped).
+        Fits the wall as x = a + b*y (x forward, y left); perpendicular when b = 0.
+        Wall rotated by alpha (robot must turn +alpha, i.e. left): b = -tan(alpha).
+        """
+        n = ranges.size
+        if n == 0:
+            return None
+        th = np.arange(n) * msg.angle_increment
+        th = np.arctan2(np.sin(th), np.cos(th))
+        m = ((np.abs(th) <= np.radians(self.ALIGN_FIT_DEG)) & np.isfinite(ranges)
+             & (ranges > msg.range_min) & (ranges < msg.range_max))
+        if m.sum() < 10:
+            return None
+        x = ranges[m] * np.cos(th[m])
+        y = ranges[m] * np.sin(th[m])
+        b, a = np.polyfit(y, x, 1)
+        # one pass of outlier rejection (objects in front of the wall, noise)
+        res = np.abs(x - (a + b * y))
+        keep = res <= max(3.0 * float(np.median(res)), 0.01)
+        if keep.sum() < 10:
+            return None
+        b, a = np.polyfit(y[keep], x[keep], 1)
+        return float(-np.arctan(b))
 
     def _mark_invalid_scan(self, zone: np.ndarray, msg: LaserScan):
         if zone.size == 0:
@@ -329,9 +376,10 @@ class LaserProcessor(Node):
             log.info(f'AUTO     | {self.auto.status()}')
 
     # --------------------------------------------------------------- Command
-    def _publish_speed(self, speed: float):
+    def _publish_speed(self, speed: float, turn: float = 0.0):
         self._msg.header.stamp = self.get_clock().now().to_msg()
         self._msg.twist.linear.x = speed
+        self._msg.twist.angular.z = turn
         self.publisher_.publish(self._msg)
 
     def publish_cmd(self):
@@ -421,6 +469,7 @@ class AutoTest:
     """Automated braking test: repeats the manual procedure `runs` times.
 
     Each run:
+      align    turn in place until perpendicular to the wall (ALIGN_*), re-checked at rest
       wait     standstill START_SETTLE_S at the start position
       approach drive forward with the normal braking logic (same as manual mode),
                until the first distance-based brake (min dist < threshold)
@@ -439,7 +488,7 @@ class AutoTest:
         'run', 'csv_file', 'start_dist_cm', 'brake_dist_cm', 'safe_threshold_cm', 'N_at_brake',
         'tau_e2e_ms_at_brake', 'p_e2e_at_brake', 'final_dist_cm', 'min_dist_cm',
         'stop_distance_cm', 'margin_to_crash_cm', 'crashed', 'mode', 'budget_ms_at_brake',
-        'p_crash_at_brake',
+        'p_crash_at_brake', 'align_err_deg',
     ]
 
     def __init__(self, node: 'LaserProcessor', runs: int):
@@ -451,7 +500,9 @@ class AutoTest:
         self.brake = None               # values recorded at the brake decision
         self.run_min = float('inf')
         self.results = []               # (run, final_dist, crashed)
-        self._enter('wait')
+        self.align_err = float('nan')   # deg, residual yaw error after aligning
+        self.align_ok_since = None
+        self._enter('align')
 
         mode = node.mode
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -494,7 +545,10 @@ class AutoTest:
 
     def status(self) -> str:
         start = f'{self.start_dist:.1f} cm' if self.start_dist is not None else '?'
-        return f'run {self.run}/{self.runs} | phase {self.phase} | start dist {start}'
+        yaw = self.node.wall_yaw
+        wall = f'{np.degrees(yaw):+.2f} deg' if yaw is not None else '?'
+        return (f'run {self.run}/{self.runs} | phase {self.phase} | start dist {start} | '
+                f'wall angle {wall}')
 
     # ---------------------------------------------------------------- hooks
     def on_scan(self):
@@ -510,6 +564,45 @@ class AutoTest:
         getattr(self, f'_step_{self.phase}')()
 
     # --------------------------------------------------------------- phases
+    def _step_align(self):
+        n = self.node
+        if not n.ALIGN_ENABLED:
+            self._enter('wait')
+            return
+        if self._elapsed() > n.ALIGN_TIMEOUT_S:
+            yaw = n.wall_yaw
+            self._finish('could not align to the wall within '
+                         f'{n.ALIGN_TIMEOUT_S:.0f} s (last error '
+                         f'{np.degrees(yaw) if yaw is not None else float("nan"):+.2f} deg)')
+            return
+        if not n.scan_fresh_ok() or n.wall_yaw is None:
+            n.stop_robot()
+            self.align_ok_since = None
+            return
+        tol = np.radians(n.ALIGN_TOL_DEG)
+        err = n.wall_yaw
+        if abs(err) > np.radians(n.ALIGN_MAX_DEG):
+            self._finish(f'wall angle {np.degrees(err):+.1f} deg is beyond ALIGN_MAX_DEG: '
+                         'place the bot roughly facing the wall, or flip ALIGN_SIGN if it '
+                         'turned the wrong way')
+            return
+        if abs(err) <= tol:
+            # Stop, then require the error to stay in tolerance at rest
+            n.stop_robot()
+            now = self._now()
+            if self.align_ok_since is None:
+                self.align_ok_since = now
+            elif (now - self.align_ok_since >= n.ALIGN_SETTLE_S
+                  and all(abs(e) <= tol for e in n.recent_yaws)):
+                self.align_err = float(np.degrees(np.median(n.recent_yaws)))
+                self._log().info(f'AUTO | aligned to the wall ({self.align_err:+.2f} deg)')
+                self.align_ok_since = None
+                self._enter('wait')
+            return
+        self.align_ok_since = None
+        w = min(max(n.ALIGN_KP * abs(err), n.ALIGN_MIN_W), n.ALIGN_MAX_W)
+        n._publish_speed(0.0, n.ALIGN_SIGN * (w if err > 0 else -w))
+
     def _step_wait(self):
         n = self.node
         n.stop_robot()
@@ -557,7 +650,7 @@ class AutoTest:
             f'{b["dist"]:.2f}', f'{b["thr"]:.2f}', b['N'], f'{b["tau"]:.2f}', f'{b["p"]:.4f}',
             f'{final:.2f}', f'{self.run_min:.2f}', f'{b["dist"] - final:.2f}',
             f'{self.run_min - self.node.CRASH_DIST_CM:.2f}', int(crashed),
-            n.mode, f'{b["B"]:.2f}', f'{b["pc"]:.6f}',
+            n.mode, f'{b["B"]:.2f}', f'{b["pc"]:.6f}', f'{self.align_err:+.3f}',
         ])
         self.summary_file.flush()
         n.close_csv_run()
@@ -588,7 +681,7 @@ class AutoTest:
             if self.run >= self.runs:
                 self._finish(f'all {self.runs} runs completed')
             else:
-                self._enter('wait')
+                self._enter('align')
             return
         speed = min(max(self.node.RETURN_KP * to_go, self.node.RETURN_MIN_SPEED), self.node.RETURN_SPEED)
         n._publish_speed(-speed)
