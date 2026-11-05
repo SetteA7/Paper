@@ -100,14 +100,17 @@ class LaserProcessor(Node):
         self.csv_file = open(os.path.join(CSV_DIR, f"robot_log_{ts}.csv"), mode='w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
-            'timestamp_ros', 'min_distance_cm', 'safe_threshold_cm', 'brake_state',
+            'timestamp_lidar', 'timestamp_arrival', 'scan_delay_ms', 'min_distance_cm', 'safe_threshold_cm', 'brake_state',
             'tau_tx_ms', 'tau_rx_ms', 'tau_e2e_ms', 'p_tx', 'p_rx', 'p_e2e'
         ])
 
-    def _write_csv_row(self):
-        now = self.get_clock().now().nanoseconds * 1e-9
+    def _write_csv_row(self, lidar_ns: int, arrival_ns: int):
+        """lidar = msg.header.stamp (set by the driver on the bot when the scan was taken),
+        arrival = controller clock when the scan reached scan_callback.
+        delay = arrival - lidar; only meaningful if both clocks are synced (chrony)."""
         self.csv_writer.writerow([
-            f"{now:.4f}", f"{self.min_dist_cm:.2f}", f"{self.safe_threshold:.2f}",
+            f"{lidar_ns * 1e-9:.4f}", f"{arrival_ns * 1e-9:.4f}",
+            f"{(arrival_ns - lidar_ns) * 1e-6:.2f}", f"{self.min_dist_cm:.2f}", f"{self.safe_threshold:.2f}",
             int(self.last_brake_state),
             f"{self.tau_tx:.2f}", f"{self.tau_rx:.2f}", f"{self.taue2e:.2f}",
             f"{self.p_tx:.4f}", f"{self.p_rx:.4f}", f"{self.pe2e:.4f}"
@@ -139,7 +142,8 @@ class LaserProcessor(Node):
         return v_cm_per_ms * time_buffer + self.BOT_LENGTH + self.M + self.D_BRAKE
 
     def scan_callback(self, msg: LaserScan):
-        self.last_scan_ns = self.get_clock().now().nanoseconds
+        arrival_ns = self.get_clock().now().nanoseconds
+        self.last_scan_ns = arrival_ns
 
         # array.array -> numpy without copying the whole scan
         ranges = np.asarray(msg.ranges, dtype=np.float32)
@@ -159,7 +163,8 @@ class LaserProcessor(Node):
             self.last_brake_state = True
 
         if self.csv_writer is not None:
-            self._write_csv_row()
+            lidar_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+            self._write_csv_row(lidar_ns, arrival_ns)
 
     def _mark_invalid_scan(self, zone: np.ndarray, msg: LaserScan):
         if zone.size == 0:
