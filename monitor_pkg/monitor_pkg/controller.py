@@ -22,6 +22,8 @@ from monitor_pkg.network_link import LinkStats, NetworkMonitor
 # ============================================================== TOGGLES
 # Defaults; override at launch: ros2 run monitor_pkg controller_monitor SMART NOCSV
 # Automated test: ros2 run monitor_pkg controller_monitor SMART RUNS=20  (see AutoTest)
+# Old open-ended mode (drive/brake until Ctrl+C, no return): ... controller_monitor MANUAL
+DEFAULT_RUNS = 1        # runs when RUNS= is not given (each run returns to the start)
 ENABLE_SMART = False    # True: adaptive threshold from network stats; False: fixed SAFE_THRESHOLD
 ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
 CSV_DIR = "/home/user/ros2_ws_A7/csv"
@@ -543,12 +545,15 @@ class AutoTest:
 
 def parse_flags(argv):
     """Command-line toggles, e.g. `ros2 run monitor_pkg controller_monitor SMART NOCSV`.
-    `RUNS=n` starts the automated test (AutoTest) with n runs.
+    `RUNS=n` runs the automated test (AutoTest) n times (default DEFAULT_RUNS).
+    `MANUAL` = old open-ended mode: no runs, no return, until Ctrl+C.
     Anything not given falls back to ENABLE_SMART / ENABLE_CSV."""
-    smart, log_csv, runs = ENABLE_SMART, ENABLE_CSV, 0
+    smart, log_csv, runs = ENABLE_SMART, ENABLE_CSV, DEFAULT_RUNS
     for arg in argv:
         flag = arg.upper()
-        if flag.startswith('RUNS='):
+        if flag == 'MANUAL':
+            runs = 0
+        elif flag.startswith('RUNS='):
             try:
                 runs = int(flag[5:])
             except ValueError:
@@ -565,7 +570,7 @@ def parse_flags(argv):
             log_csv = False
         else:
             raise SystemExit(
-                f"Unknown option '{arg}'. Use: SMART | NOSMART | CSV | NOCSV | RUNS=<n>")
+                f"Unknown option '{arg}'. Use: SMART | NOSMART | CSV | NOCSV | RUNS=<n> | MANUAL")
     return smart, log_csv, runs
 
 
