@@ -37,7 +37,7 @@ ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
 #   False: from the LiDAR scans: arrival time - header.stamp, median of the last
 #          SCAN_TAU_WINDOW scans (includes driver + middleware delay of the real data)
 # Loss p_rx and the uplink tau_tx always come from the ping.
-usePingTauRX = False
+usePingTauRX = True
 CSV_DIR = "/home/user/ros2_ws_A7/csv"
 
 
