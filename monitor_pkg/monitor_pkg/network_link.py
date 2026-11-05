@@ -83,11 +83,11 @@ class Direction:
         return restarted
 
     def on_tick(self, now: float):
-        """Call once per period: counts a lost packet while the link is silent."""
-        if now - self.last_rx > self.timeout:
+        """Call once per period: counts a lost packet while the link is silent.
+        Nothing is counted before the first packet (no peer yet, nothing to lose)."""
+        if self.expected is not None and now - self.last_rx > self.timeout:
             self.received.append(0)
-            if self.expected is not None:
-                self.expected += 1
+            self.expected += 1
 
     @property
     def loss(self) -> float:

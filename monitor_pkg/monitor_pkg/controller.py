@@ -2,6 +2,7 @@ import bisect
 import csv
 import os
 import sys
+from collections import deque
 from datetime import datetime
 
 import numpy as np
@@ -20,6 +21,7 @@ from monitor_pkg.network_link import LinkStats, NetworkMonitor
 
 # ============================================================== TOGGLES
 # Defaults; override at launch: ros2 run monitor_pkg controller_monitor SMART NOCSV
+# Automated test: ros2 run monitor_pkg controller_monitor SMART RUNS=20  (see AutoTest)
 ENABLE_SMART = False    # True: adaptive threshold from network stats; False: fixed SAFE_THRESHOLD
 ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
 CSV_DIR = "/home/user/ros2_ws_A7/csv"
@@ -32,8 +34,8 @@ class LaserProcessor(Node):
     # --- Robot parameters (MEASURED IN LAB) ---
     M = 5                           # safety margin (cm)
     BOT_LENGTH = 18.75              # bot length (cm)
-    D_BRAKE = 18.1                  # braking distance (cm)
-    VMAX = 43.77                    # max speed (cm/s)
+    D_BRAKE = 12.59                  # braking distance (cm)
+    VMAX = 43.84                    # max speed (cm/s)
     T = 100                         # control period (ms) SAME AS LIDAR
     SAFE_THRESHOLD = 75             # fixed brake threshold [S] (cm), used when SMART is off
 
@@ -50,7 +52,18 @@ class LaserProcessor(Node):
     SCAN_TIMEOUT_NS = 500_000_000   # 0.5 s without scans -> brake (lidar dead / driver crashed)
     STATUS_PERIOD = 1.0             # s, period of the LIDAR + NET status log
 
-    def __init__(self, smart: bool = ENABLE_SMART, log_csv: bool = ENABLE_CSV):
+    # --- AUTO test mode (RUNS=n on the command line, see AutoTest) ---
+    CRASH_DIST_CM = BOT_LENGTH      # lidar reading at/below this = crash (lidar -> front bumper)
+    STOP_SETTLE_S = 2.0             # after the brake: wait, then measure where the bot stopped
+    START_SETTLE_S = 2.0            # standstill at the start position before each run
+    RETURN_SPEED = 0.2              # m/s, max reverse speed when going back to the start
+    RETURN_MIN_SPEED = 0.05         # m/s, slowest reverse speed (below this it may not move)
+    RETURN_KP = 0.01                # (m/s) per cm still to go while reversing
+    RETURN_TOL_CM = 2.0             # start position reached when within this distance
+    RETURN_TIMEOUT_S = 30.0         # abort if the start position is not reached in time
+    REAR_STOP_CM = 30.0             # abort reversing if anything is this close behind the lidar
+
+    def __init__(self, smart: bool = ENABLE_SMART, log_csv: bool = ENABLE_CSV, runs: int = 0):
         super().__init__('laser_processor')
         self.smart = smart
 
@@ -64,6 +77,8 @@ class LaserProcessor(Node):
         self.link_seen = False
         self.current_N = 1
         self._last_sent_brake = None    # last command sent, to log only on changes
+        self.rear_min_cm = float('inf')  # closest object behind (for reversing in AUTO mode)
+        self.recent_dists = deque(maxlen=5)  # last valid front distances (cm), for medians
 
         # --- Network (placeholders until the first heartbeat from the bot) ---
         self.tau_tx = 10
@@ -85,19 +100,28 @@ class LaserProcessor(Node):
         # --- CSV ---
         self.csv_file = None
         self.csv_writer = None
-        if log_csv:
+        # AUTO mode opens one CSV per run itself
+        self.auto = AutoTest(self, runs) if runs > 0 else None
+        if log_csv and self.auto is None:
             self._open_csv()
 
         self.get_logger().info(
             f'START | SMART {"ON" if self.smart else "OFF"} | '
             f'CSV {self.csv_file.name if self.csv_file else "OFF"} | '
-            f'speed {self.LINEAR_SPEED} m/s')
+            f'speed {self.LINEAR_SPEED} m/s'
+            + (f' | AUTO {runs} runs -> {self.auto.session_dir}' if self.auto else ''))
+
+    @property
+    def finished(self) -> bool:
+        return self.auto is not None and self.auto.finished
 
     # ------------------------------------------------------------------ CSV
-    def _open_csv(self):
-        os.makedirs(CSV_DIR, exist_ok=True)
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.csv_file = open(os.path.join(CSV_DIR, f"robot_log_{ts}.csv"), mode='w', newline='')
+    def _open_csv(self, path: str | None = None):
+        if path is None:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            path = os.path.join(CSV_DIR, f"robot_log_{ts}.csv")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.csv_file = open(path, mode='w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
             'timestamp_lidar', 'timestamp_arrival', 'scan_delay_ms', 'min_distance_cm', 'safe_threshold_cm', 'brake_state',
@@ -116,11 +140,21 @@ class LaserProcessor(Node):
             f"{self.p_tx:.4f}", f"{self.p_rx:.4f}", f"{self.pe2e:.4f}"
         ])
 
+    def close_csv_run(self):
+        """Close the current CSV only (AUTO mode: end of a run)."""
+        if self.csv_file is not None and not self.csv_file.closed:
+            self.csv_file.flush()
+            self.csv_file.close()
+        self.csv_writer = None
+
     def close_csv(self):
         """Idempotent: safe to call even if CSV logging is disabled."""
         if self.csv_file is not None and not self.csv_file.closed:
             self.csv_file.flush()
             self.csv_file.close()
+        self.csv_writer = None
+        if self.auto is not None:
+            self.auto.close()
 
     # --------------------------------------------------------------- Network
     def on_link_update(self, s: LinkStats):
@@ -157,10 +191,20 @@ class LaserProcessor(Node):
             self.scan_status = 'ok'
             self.min_dist_cm = float(valid.min()) * 100.0
             self.last_brake_state = self.min_dist_cm < self.safe_threshold
+            self.recent_dists.append(self.min_dist_cm)
         else:
             self._mark_invalid_scan(zone, msg)
             self.min_dist_cm = -1.0
             self.last_brake_state = True
+
+        # Rear sector (around the middle of the array), used only when reversing
+        mid = ranges.size // 2
+        rear = ranges[max(mid - self.K, 0):mid + self.K]
+        rear = rear[(rear > msg.range_min) & (rear < msg.range_max) & np.isfinite(rear)]
+        self.rear_min_cm = float(rear.min()) * 100.0 if rear.size else float('inf')
+
+        if self.auto is not None:
+            self.auto.on_scan()
 
         if self.csv_writer is not None:
             lidar_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
@@ -224,10 +268,15 @@ class LaserProcessor(Node):
         else:
             log.info(f'DIST     | min {self.min_dist_cm:6.1f} cm')
 
-        # 3. Decision
-        brake, reason = self._decision(now_ns)
-        action = 'BRAKE' if brake else f'SAFE, moving {self.LINEAR_SPEED} m/s'
-        log.info(f'DECISION | {self._mode_str()} | {action} ({reason})')
+        # 3. Decision (in AUTO mode it only drives the bot during the approach)
+        if self.auto is None or self.auto.phase == 'approach':
+            brake, reason = self._decision(now_ns)
+            action = 'BRAKE' if brake else f'SAFE, moving {self.LINEAR_SPEED} m/s'
+            log.info(f'DECISION | {self._mode_str()} | {action} ({reason})')
+
+        # 4. Automated test
+        if self.auto is not None:
+            log.info(f'AUTO     | {self.auto.status()}')
 
     # --------------------------------------------------------------- Command
     def _publish_speed(self, speed: float):
@@ -236,6 +285,18 @@ class LaserProcessor(Node):
         self.publisher_.publish(self._msg)
 
     def publish_cmd(self):
+        """Control step, every T ms."""
+        if self.auto is not None:
+            self.auto.step()
+        else:
+            self.drive_by_decision()
+
+    def scan_fresh_ok(self) -> bool:
+        now_ns = self.get_clock().now().nanoseconds
+        return self.scan_status == 'ok' and not self._scan_stale(now_ns)
+
+    def drive_by_decision(self) -> tuple[bool, str]:
+        """The braking experiment itself: move forward unless the decision says brake."""
         brake, reason = self._decision(self.get_clock().now().nanoseconds)
         self._publish_speed(0.0 if brake else self.LINEAR_SPEED)
 
@@ -246,6 +307,7 @@ class LaserProcessor(Node):
                 self.get_logger().warn(f'>>> BRAKE sent | {self._mode_str()} | {reason}')
             else:
                 self.get_logger().info(f'>>> SAFE, moving | {self._mode_str()} | {reason}')
+        return brake, reason
 
     def stop_robot(self):
         self._publish_speed(0.0)
@@ -305,13 +367,195 @@ class LaserProcessor(Node):
         return self.current_N
 
 
+class AutoTest:
+    """Automated braking test: repeats the manual procedure `runs` times.
+
+    Each run:
+      wait     standstill START_SETTLE_S at the start position
+      approach drive forward with the normal braking logic (same as manual mode),
+               until the first distance-based brake (min dist < threshold)
+      stopping send 0 for STOP_SETTLE_S, then measure where the bot stopped
+      return   reverse (forward/backward only) to the start distance
+    The start distance is the front distance measured before run 1.
+    The session stops after `runs` runs, or at the first crash
+    (closest front reading during the run <= CRASH_DIST_CM).
+
+    Output in CSV_DIR/auto_<mode>_<time>/:
+      run_001.csv ...  same columns as the manual CSV, approach + stopping only
+      summary.csv      one row per run
+    """
+
+    SUMMARY_HEADER = [
+        'run', 'csv_file', 'start_dist_cm', 'brake_dist_cm', 'safe_threshold_cm', 'N_at_brake',
+        'tau_e2e_ms_at_brake', 'p_e2e_at_brake', 'final_dist_cm', 'min_dist_cm',
+        'stop_distance_cm', 'margin_to_crash_cm', 'crashed',
+    ]
+
+    def __init__(self, node: 'LaserProcessor', runs: int):
+        self.node = node
+        self.runs = runs
+        self.run = 0
+        self.finished = False
+        self.start_dist = None
+        self.brake = None               # values recorded at the brake decision
+        self.run_min = float('inf')
+        self.results = []               # (run, final_dist, crashed)
+        self._enter('wait')
+
+        mode = 'SMART' if node.smart else 'FIXED'
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.session_dir = os.path.join(CSV_DIR, f'auto_{mode}_{ts}')
+        os.makedirs(self.session_dir, exist_ok=True)
+        self.summary_file = open(os.path.join(self.session_dir, 'summary.csv'), 'w', newline='')
+        self.summary = csv.writer(self.summary_file)
+        self.summary.writerow(self.SUMMARY_HEADER)
+        self.summary_file.flush()
+
+    # -------------------------------------------------------------- helpers
+    def _now(self) -> float:
+        return self.node.get_clock().now().nanoseconds * 1e-9
+
+    def _enter(self, phase: str):
+        self.phase = phase
+        self.t0 = self._now()
+
+    def _elapsed(self) -> float:
+        return self._now() - self.t0
+
+    def _median_dist(self) -> float:
+        return float(np.median(self.node.recent_dists))
+
+    def _log(self):
+        return self.node.get_logger()
+
+    def _finish(self, why: str):
+        self.node.stop_robot()
+        self.node.close_csv()           # closes the run CSV and the summary
+        self.finished = True
+        crashes = sum(1 for _, _, c in self.results if c)
+        self._log().info(f'AUTO DONE | {why} | {len(self.results)} runs, {crashes} crash(es) | '
+                         f'results in {self.session_dir}')
+
+    def close(self):
+        if not self.summary_file.closed:
+            self.summary_file.flush()
+            self.summary_file.close()
+
+    def status(self) -> str:
+        start = f'{self.start_dist:.1f} cm' if self.start_dist is not None else '?'
+        return f'run {self.run}/{self.runs} | phase {self.phase} | start dist {start}'
+
+    # ---------------------------------------------------------------- hooks
+    def on_scan(self):
+        """Track the closest front reading while the run is being recorded."""
+        if self.phase in ('approach', 'stopping') and self.node.scan_status == 'ok':
+            self.run_min = min(self.run_min, self.node.min_dist_cm)
+
+    def step(self):
+        """Called every control period T instead of the manual-mode command."""
+        if self.finished:
+            self.node.stop_robot()
+            return
+        getattr(self, f'_step_{self.phase}')()
+
+    # --------------------------------------------------------------- phases
+    def _step_wait(self):
+        n = self.node
+        n.stop_robot()
+        if self._elapsed() < self.node.START_SETTLE_S or not n.scan_fresh_ok() \
+                or len(n.recent_dists) < n.recent_dists.maxlen or not n.link_seen:
+            return
+        dist = self._median_dist()
+        if self.start_dist is None:
+            self.start_dist = dist
+            self._log().info(f'AUTO | start distance set to {dist:.1f} cm')
+        if dist <= n.safe_threshold:
+            self._log().warn(f'AUTO | start {dist:.1f} cm is already below the threshold '
+                             f'{n.safe_threshold:.1f} cm: the bot will brake immediately')
+
+        self.run += 1
+        self.run_start = dist
+        self.run_min = float('inf')
+        self.brake = None
+        n._open_csv(os.path.join(self.session_dir, f'run_{self.run:03d}.csv'))
+        n._last_sent_brake = None       # log the first command of the run
+        self._log().info(f'AUTO | ===== run {self.run}/{self.runs} start ({dist:.1f} cm) =====')
+        self._enter('approach')
+
+    def _step_approach(self):
+        n = self.node
+        brake, reason = n.drive_by_decision()
+        # Only a distance-based brake ends the run; stale/invalid scans just pause it
+        if brake and n.scan_fresh_ok() and n.last_brake_state:
+            self.brake = dict(dist=n.min_dist_cm, thr=n.safe_threshold, N=n.current_N,
+                              tau=n.taue2e, p=n.pe2e)
+            self._log().info(f'AUTO | run {self.run} braked ({reason})')
+            self._enter('stopping')
+
+    def _step_stopping(self):
+        n = self.node
+        n.stop_robot()
+        if self._elapsed() < self.node.STOP_SETTLE_S or not n.scan_fresh_ok():
+            return
+        final = self._median_dist()
+        crashed = self.run_min <= self.node.CRASH_DIST_CM
+        b = self.brake
+        self.summary.writerow([
+            self.run, f'run_{self.run:03d}.csv', f'{self.run_start:.2f}',
+            f'{b["dist"]:.2f}', f'{b["thr"]:.2f}', b['N'], f'{b["tau"]:.2f}', f'{b["p"]:.4f}',
+            f'{final:.2f}', f'{self.run_min:.2f}', f'{b["dist"] - final:.2f}',
+            f'{self.run_min - self.node.CRASH_DIST_CM:.2f}', int(crashed),
+        ])
+        self.summary_file.flush()
+        n.close_csv_run()
+        self.results.append((self.run, final, crashed))
+        self._log().info(f'AUTO | run {self.run} result: braked at {b["dist"]:.1f} cm, '
+                         f'stopped at {final:.1f} cm, closest {self.run_min:.1f} cm'
+                         f'{" -> CRASH" if crashed else ""}')
+        if crashed:
+            self._finish(f'CRASH in run {self.run}')
+        else:
+            self._enter('return')
+
+    def _step_return(self):
+        n = self.node
+        if self._elapsed() > self.node.RETURN_TIMEOUT_S:
+            self._finish(f'start position not reached within {self.node.RETURN_TIMEOUT_S:.0f} s')
+            return
+        if not n.scan_fresh_ok():
+            n.stop_robot()              # wait for valid scans
+            return
+        if n.rear_min_cm < self.node.REAR_STOP_CM:
+            self._finish(f'obstacle {n.rear_min_cm:.1f} cm behind while reversing '
+                         f'(limit REAR_STOP_CM = {self.node.REAR_STOP_CM:.0f} cm)')
+            return
+        to_go = self.start_dist - n.min_dist_cm
+        if to_go <= self.node.RETURN_TOL_CM:
+            n.stop_robot()
+            if self.run >= self.runs:
+                self._finish(f'all {self.runs} runs completed')
+            else:
+                self._enter('wait')
+            return
+        speed = min(max(self.node.RETURN_KP * to_go, self.node.RETURN_MIN_SPEED), self.node.RETURN_SPEED)
+        n._publish_speed(-speed)
+
+
 def parse_flags(argv):
     """Command-line toggles, e.g. `ros2 run monitor_pkg controller_monitor SMART NOCSV`.
+    `RUNS=n` starts the automated test (AutoTest) with n runs.
     Anything not given falls back to ENABLE_SMART / ENABLE_CSV."""
-    smart, log_csv = ENABLE_SMART, ENABLE_CSV
+    smart, log_csv, runs = ENABLE_SMART, ENABLE_CSV, 0
     for arg in argv:
         flag = arg.upper()
-        if flag == 'SMART':
+        if flag.startswith('RUNS='):
+            try:
+                runs = int(flag[5:])
+            except ValueError:
+                raise SystemExit(f"Bad option '{arg}': use RUNS=<number>")
+            if runs < 1:
+                raise SystemExit('RUNS must be >= 1')
+        elif flag == 'SMART':
             smart = True
         elif flag == 'NOSMART':
             smart = False
@@ -320,16 +564,17 @@ def parse_flags(argv):
         elif flag == 'NOCSV':
             log_csv = False
         else:
-            raise SystemExit(f"Unknown option '{arg}'. Use: SMART | NOSMART | CSV | NOCSV")
-    return smart, log_csv
+            raise SystemExit(
+                f"Unknown option '{arg}'. Use: SMART | NOSMART | CSV | NOCSV | RUNS=<n>")
+    return smart, log_csv, runs
 
 
 def main(args=None):
     # Strip --ros-args ... so only our own flags are left
-    smart, log_csv = parse_flags(remove_ros_args(args=sys.argv)[1:])
+    smart, log_csv, runs = parse_flags(remove_ros_args(args=sys.argv)[1:])
     rclpy.init(args=args)
 
-    laser_node = LaserProcessor(smart=smart, log_csv=log_csv)
+    laser_node = LaserProcessor(smart=smart, log_csv=log_csv, runs=runs)
     # log_period=None: the controller logs the network stats in log_status()
     network_node = NetworkMonitor(on_update=laser_node.on_link_update, log_period=None)
 
@@ -338,7 +583,9 @@ def main(args=None):
     executor.add_node(network_node)
 
     try:
-        executor.spin()
+        # AUTO mode ends by itself (all runs done / crash); manual mode runs until Ctrl+C
+        while rclpy.ok() and not laser_node.finished:
+            executor.spin_once(timeout_sec=0.1)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
