@@ -48,13 +48,13 @@ CSV_DIR = os.path.expanduser("~/ros2_ws_A7/csv")   # ~ = home of whoever runs it
 
 class LaserProcessor(Node):
     # --- Laser ---
-    K = 100                         # samples used at the beginning/end of the array
+    K = 10                         # samples used at the beginning/end of the array
 
     # --- Robot parameters (MEASURED IN LAB) ---
     M = 5                           # safety margin (cm)
     BOT_LENGTH = 18.75              # bot length (cm)
-    D_BRAKE = 12.59                  # braking distance (cm)
-    VMAX = 43.84                    # max speed (cm/s)
+    D_BRAKE = 14.42                  # braking distance (cm)
+    VMAX = 44.91                    # max speed (cm/s)
     T = 100                         # control period (ms) SAME AS LIDAR
     SAFE_THRESHOLD = 75             # fixed brake threshold [S] (cm), used when SMART is off
 
