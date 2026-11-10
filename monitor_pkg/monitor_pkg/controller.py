@@ -60,7 +60,7 @@ class LaserProcessor(Node):
     # --- Retransmission count N ---
     P_TARGET = 0.05
     MAX_LINEAR_STEPS = 4
-    N_MAX = 20000                     # hard cap (prevents endless loops if p ~ 1) (was 200)
+    N_MAX = 20000                   # hard cap (prevents endless loops if p ~ 1) (was 200)
 
     # --- Timing ---
     SCAN_TIMEOUT_NS = 500_000_000   # 0.5 s without scans -> brake (lidar dead / driver crashed)
@@ -77,6 +77,12 @@ class LaserProcessor(Node):
     RETURN_TOL_CM = 2.0             # start position reached when within this distance
     RETURN_TIMEOUT_S = 30.0         # abort if the start position is not reached in time
     REAR_STOP_CM = 30.0             # abort reversing if anything is this close behind the lidar
+
+    # --- Cruise speed (AUTO mode): measured in each run, used as VMAX in the next one ---
+    VMAX_FROM_RUNS = True           # False: always use the VMAX constant above
+    CRUISE_FRAC = 0.9               # cruise = speed >= this fraction of the speed just before the brake
+    CRUISE_MIN_SCANS = 4            # fewer cruise scans than this: keep the previous VMAX
+    VMAX_MAX_CHANGE = 0.2           # measured speed > 20% away from the current VMAX: not used
 
     # --- Alignment before each AUTO run: turn in place until perpendicular to the wall ---
     ALIGN_ENABLED = True
@@ -103,6 +109,7 @@ class LaserProcessor(Node):
         self.last_brake_state = True    # start braked until the first valid scan
         self.min_dist_cm = -1.0
         self.last_scan_ns = None
+        self.last_lidar_ns = None       # header.stamp of the last scan (bot clock)
         self.scan_status = 'none'       # 'none' | 'empty' | 'invalid' | 'ok'
         self.scan_detail = ''
         self.link_seen = False
@@ -160,7 +167,7 @@ class LaserProcessor(Node):
         self.csv_writer.writerow([
             'timestamp_lidar', 'timestamp_arrival', 'scan_delay_ms', 'min_distance_cm', 'safe_threshold_cm', 'brake_state',
             'tau_tx_ms', 'tau_rx_ms', 'tau_e2e_ms', 'p_tx', 'p_rx', 'p_e2e',
-            'budget_ms', 'p_crash'
+            'budget_ms', 'p_crash', 'vmax_cm_s'
         ])
 
     def _write_csv_row(self, lidar_ns: int, arrival_ns: int):
@@ -173,7 +180,7 @@ class LaserProcessor(Node):
             int(self.last_brake_state),
             f"{self.tau_tx:.2f}", f"{self.tau_rx:.2f}", f"{self.taue2e:.2f}",
             f"{self.p_tx:.4f}", f"{self.p_rx:.4f}", f"{self.pe2e:.4f}",
-            f"{self.budget_ms:.2f}", f"{self.p_crash:.6f}"
+            f"{self.budget_ms:.2f}", f"{self.p_crash:.6f}", f"{self.VMAX:.2f}"
         ])
 
     def close_csv_run(self):
@@ -235,6 +242,7 @@ class LaserProcessor(Node):
         arrival_ns = self.get_clock().now().nanoseconds
         self.last_scan_ns = arrival_ns
         lidar_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        self.last_lidar_ns = lidar_ns
         if not usePingTauRX:
             # Downlink latency measured on the real sensor data (needs synced clocks)
             self.scan_delays.append((arrival_ns - lidar_ns) * 1e-6)
@@ -483,6 +491,46 @@ class LaserProcessor(Node):
         return self.current_N
 
 
+def cruise_speed(t_s, d_cm, frac: float, min_scans: int) -> tuple[float | None, int]:
+    """Average speed (cm/s) over the constant-speed part of an approach.
+
+    t_s, d_cm: lidar stamp (s) and front distance (cm) of each valid scan of the
+    approach, up to and including the scan that triggered the brake (the bot is
+    still at full speed when that scan is taken: braking starts only after it).
+    Walking back from the brake, scans belong to the cruise while the speed over
+    two intervals stays >= frac * the speed just before the brake; this drops the
+    acceleration from standstill. The speed is the least-squares slope of distance
+    vs time over the cruise scans, which averages out the lidar noise.
+    Returns (speed, cruise scans), or (None, scans) if fewer than min_scans or if
+    the bot was still accelerating (second half of the window faster than the
+    first by more than 1/frac: the start was too close to the threshold).
+    """
+    t = np.asarray(t_s, dtype=np.float64)
+    d = np.asarray(d_cm, dtype=np.float64)
+    if t.size < max(min_scans, 4):
+        return None, 0
+    dt = t[2:] - t[:-2]
+    if np.any(dt <= 0):
+        return None, 0
+    s = (d[:-2] - d[2:]) / dt              # s[k]: speed over scans k .. k+2
+    v_ref = float(np.median(s[-3:]))
+    if v_ref <= 0:
+        return None, 0
+    k = s.size - 1
+    while k > 0 and s[k - 1] >= frac * v_ref:
+        k -= 1
+    n = t.size - k                          # cruise scans: k .. end
+    if n < min_scans:
+        return None, n
+    m = k + (n - 1) // 2                    # split the window in two halves
+    v_first = (d[k] - d[m]) / (t[m] - t[k])
+    v_second = (d[m] - d[-1]) / (t[-1] - t[m])
+    if v_first <= 0 or v_second > v_first / frac:
+        return None, n
+    slope = np.polyfit(t[k:] - t[k], d[k:], 1)[0]
+    return (float(-slope), n) if slope < 0 else (None, n)
+
+
 class AutoTest:
     """Automated braking test: repeats the manual procedure `runs` times.
 
@@ -496,6 +544,9 @@ class AutoTest:
     The start distance is the front distance measured before run 1.
     The session stops after `runs` runs, or at the first crash
     (closest front reading during the run <= CRASH_DIST_CM).
+    Cruise speed: at the brake, the speed of the constant-speed part of the approach
+    is measured (see cruise_speed) and, with VMAX_FROM_RUNS, used as VMAX from the
+    next run on. Run 1 uses the VMAX constant.
 
     Output in CSV_DIR/auto_<mode>_<time>/:
       run_001.csv ...  same columns as the manual CSV, approach + stopping only
@@ -507,6 +558,10 @@ class AutoTest:
         'tau_e2e_ms_at_brake', 'p_e2e_at_brake', 'final_dist_cm', 'min_dist_cm',
         'stop_distance_cm', 'margin_to_crash_cm', 'crashed', 'mode', 'budget_ms_at_brake',
         'p_crash_at_brake', 'align_err_deg',
+        # robot / model parameters used for this run (constants of LaserProcessor)
+        'VMAX_cm_s', 'T_ms', 'D_BRAKE_cm', 'L_cm', 'M_cm', 'V_CMD_cm_s',
+        # cruise speed measured in this run (VMAX of the next run), scans it was fitted on
+        'v_cruise_cm_s', 'cruise_scans',
     ]
 
     def __init__(self, node: 'LaserProcessor', runs: int):
@@ -517,6 +572,7 @@ class AutoTest:
         self.start_dist = None
         self.brake = None               # values recorded at the brake decision
         self.run_min = float('inf')
+        self.track = []                 # (lidar stamp s, front dist cm) of the approach scans
         self.results = []               # (run, final_dist, crashed)
         self.align_err = float('nan')   # deg, residual yaw error after aligning
         self.align_ok_since = None
@@ -573,6 +629,9 @@ class AutoTest:
         """Track the closest front reading while the run is being recorded."""
         if self.phase in ('approach', 'stopping') and self.node.scan_status == 'ok':
             self.run_min = min(self.run_min, self.node.min_dist_cm)
+            if self.phase == 'approach':
+                # lidar stamps: spaced by the scan period, free of network jitter
+                self.track.append((self.node.last_lidar_ns * 1e-9, self.node.min_dist_cm))
 
     def step(self):
         """Called every control period T instead of the manual-mode command."""
@@ -638,6 +697,7 @@ class AutoTest:
         self.run += 1
         self.run_start = dist
         self.run_min = float('inf')
+        self.track = []
         self.brake = None
         n._open_csv(os.path.join(self.session_dir, f'run_{self.run:03d}.csv'))
         n._last_sent_brake = None       # log the first command of the run
@@ -649,10 +709,16 @@ class AutoTest:
         brake, reason = n.drive_by_decision()
         # Only a distance-based brake ends the run; stale/invalid scans just pause it
         if brake and n.scan_fresh_ok() and n.last_brake_state:
+            # on_scan ran before this step, so the track already holds the brake scan
+            t, d = zip(*self.track) if self.track else ((), ())
+            v, n_cruise = cruise_speed(t, d, n.CRUISE_FRAC, n.CRUISE_MIN_SCANS)
             self.brake = dict(dist=n.min_dist_cm, thr=n.safe_threshold, N=n.current_N,
                               B=n.budget_ms, pc=n.p_crash,
-                              tau=n.taue2e, p=n.pe2e)
-            self._log().info(f'AUTO | run {self.run} braked ({reason})')
+                              tau=n.taue2e, p=n.pe2e, v=v, n_cruise=n_cruise)
+            cruise = (f'cruise {v:.2f} cm/s over {n_cruise} scans' if v is not None else
+                      f'cruise speed not measured (no steady part of >= '
+                      f'{n.CRUISE_MIN_SCANS} scans before the brake)')
+            self._log().info(f'AUTO | run {self.run} braked ({reason}) | {cruise}')
             self._enter('stopping')
 
     def _step_stopping(self):
@@ -669,9 +735,23 @@ class AutoTest:
             f'{final:.2f}', f'{self.run_min:.2f}', f'{b["dist"] - final:.2f}',
             f'{self.run_min - self.node.CRASH_DIST_CM:.2f}', int(crashed),
             n.mode, f'{b["B"]:.2f}', f'{b["pc"]:.6f}', f'{self.align_err:+.3f}',
+            f'{n.VMAX:g}', f'{n.T:g}', f'{n.D_BRAKE:g}', f'{n.BOT_LENGTH:g}', f'{n.M:g}',
+            f'{n.LINEAR_SPEED * 100:g}',
+            f'{b["v"]:.2f}' if b['v'] is not None else '', b['n_cruise'],
         ])
         self.summary_file.flush()
         n.close_csv_run()
+        if n.VMAX_FROM_RUNS:
+            v = b['v']
+            if v is None:
+                self._log().warn(f'AUTO | cruise speed not measured: VMAX stays {n.VMAX:.2f} cm/s')
+            elif abs(v - n.VMAX) > n.VMAX_MAX_CHANGE * n.VMAX:
+                self._log().warn(f'AUTO | cruise speed {v:.2f} cm/s is more than '
+                                 f'{n.VMAX_MAX_CHANGE:.0%} away from VMAX: not used, '
+                                 f'VMAX stays {n.VMAX:.2f} cm/s')
+            else:
+                self._log().info(f'AUTO | VMAX for the next run: {v:.2f} cm/s (was {n.VMAX:.2f})')
+                n.VMAX = v              # instance value, overrides the class constant
         self.results.append((self.run, final, crashed))
         self._log().info(f'AUTO | run {self.run} result: braked at {b["dist"]:.1f} cm, '
                          f'stopped at {final:.1f} cm, closest {self.run_min:.1f} cm'
