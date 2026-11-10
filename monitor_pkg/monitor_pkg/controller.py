@@ -1,6 +1,7 @@
 import bisect
 import csv
 import os
+import random
 import sys
 import time
 from collections import deque
@@ -82,6 +83,7 @@ class LaserProcessor(Node):
     CRASH_DIST_CM = BOT_LENGTH      # lidar reading at/below this = crash (lidar -> front bumper)
     STOP_SETTLE_S = 2.0             # after the brake: wait, then measure where the bot stopped
     START_SETTLE_S = 2.0            # standstill at the start position before each run
+    RANDOM_START = True             # delay the first GO of each run by U(0, T): phi ~ U(0, T)
     RETURN_SPEED = 0.2              # m/s, max reverse speed when going back to the start
     RETURN_MIN_SPEED = 0.05         # m/s, slowest reverse speed (below this it may not move)
     RETURN_KP = 0.01                # (m/s) per cm still to go while reversing
@@ -588,6 +590,11 @@ class AutoTest:
     The start distance is the front distance measured before run 1.
     The session stops after `runs` runs, or at the first crash
     (closest front reading during the run <= CRASH_DIST_CM).
+    Random start (RANDOM_START): after `wait`, the first GO is sent by a one-shot timer
+    U(0, T) after the control tick (phase `launch`), not on the tick. The bot applies
+    /cmd_vel on arrival, so the whole trajectory shifts by a random fraction of a period
+    against the LiDAR samples and phi (crossing -> next sample) is U(0, T) in every run.
+    Without it phi is fixed by the start position and the runs are not independent.
     Cruise speed: at the brake, the speed of the constant-speed part of the approach
     is measured (see cruise_speed) and, with VMAX_FROM_RUNS, used as VMAX from the
     next run on. Run 1 uses the VMAX constant.
@@ -608,6 +615,8 @@ class AutoTest:
         'v_cruise_cm_s', 'cruise_scans',
         # psi used by the model at the brake, and the measured wait of the STOP itself
         'psi_ms_at_brake', 'psi_stop_ms',
+        # random delay of the first GO after the control tick (empty if RANDOM_START is off)
+        'start_delay_ms',
     ]
 
     def __init__(self, node: 'LaserProcessor', runs: int):
@@ -622,6 +631,8 @@ class AutoTest:
         self.results = []               # (run, final_dist, crashed)
         self.align_err = float('nan')   # deg, residual yaw error after aligning
         self.align_ok_since = None
+        self.start_delay_ms = None      # random delay of this run's first GO
+        self._launch_timer = None       # one-shot timer that sends it
         self._enter('align')
 
         mode = node.mode
@@ -747,8 +758,30 @@ class AutoTest:
         self.brake = None
         n._open_csv(os.path.join(self.session_dir, f'run_{self.run:03d}.csv'))
         n._last_sent_brake = None       # log the first command of the run
-        self._log().info(f'AUTO | ===== run {self.run}/{self.runs} start ({dist:.1f} cm) =====')
+        if not n.RANDOM_START:
+            self.start_delay_ms = None
+            self._log().info(f'AUTO | ===== run {self.run}/{self.runs} start ({dist:.1f} cm) =====')
+            self._enter('approach')
+            return
+        # First GO off the tick grid: one-shot timer, the executor keeps running meanwhile
+        self.start_delay_ms = random.uniform(0.0, float(n.T))
+        self._log().info(f'AUTO | ===== run {self.run}/{self.runs} start ({dist:.1f} cm), '
+                         f'GO in {self.start_delay_ms:.1f} ms =====')
+        self._enter('launch')
+        self._launch_timer = n.create_timer(max(self.start_delay_ms, 0.1) / 1000.0, self._launch)
+
+    def _step_launch(self):
+        """Ticks while the one-shot GO is pending: keep the bot still, as in `wait`."""
+        self.node.stop_robot()
+
+    def _launch(self):
+        """One-shot: first GO of the run, then the normal approach on the ticks."""
+        self.node.destroy_timer(self._launch_timer)
+        self._launch_timer = None
+        if self.finished or self.phase != 'launch':
+            return
         self._enter('approach')
+        self._step_approach()           # sends GO (or brakes at once if already below S)
 
     def _step_approach(self):
         n = self.node
@@ -788,6 +821,7 @@ class AutoTest:
             f'{n.LINEAR_SPEED * 100:g}',
             f'{b["v"]:.2f}' if b['v'] is not None else '', b['n_cruise'],
             f'{b["psi"]:.2f}', f'{b["psi_stop"]:.2f}',
+            f'{self.start_delay_ms:.2f}' if self.start_delay_ms is not None else '',
         ])
         self.summary_file.flush()
         n.close_csv_run()
