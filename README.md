@@ -46,6 +46,9 @@ loss (missing sequence numbers over the last 100). The bot reports its uplink
 measurements back in its heartbeats. When the controller restarts, the bot detects
 it and resets its statistics.
 
+Both ends also receive the other machine's `noise` and log its rate and loss
+(see [`noise`](#noise-network-load-generator)). After updating, restart `bot_monitor` once.
+
 ## `controller_monitor` (run on the controller)
 
 ```bash
@@ -136,26 +139,24 @@ All settings are constants at the top of
 
 ## `noise` (network load generator)
 
-Loads the link going **out** of the machine it runs on, with random-byte
-messages (best effort, not retransmitted).
+Loads the link going **out** of the machine it runs on, with random-byte ROS
+messages (best effort, not retransmitted) that travel through the Zenoh bridge like
+the real traffic.
 
 ```bash
-ros2 run monitor_pkg noise kbps=1024              # send 1.024 Mbit/s (and receive)
-ros2 run monitor_pkg noise role=sink              # receive only
+ros2 run monitor_pkg noise kbps=1024              # send 1.024 Mbit/s
 ```
 
 | option | default | meaning |
 |---|---|---|
 | `kbps=<n>` | 1024 | rate in kbit/s (1 kbit = 1000 bit) |
 | `hz=<n>` | 100 | messages per second; size = kbps*1000/8/hz bytes (1024 kbps -> 1280 B) |
-| `role=send\|sink` | send | `send` = send **and** receive, `sink` = receive only |
-| `topic=<name>` | `network_noise` | must match on both machines |
 
-DDS only sends data over the network when the other machine subscribes, so:
+`noise` only sends. The receiver is built into the link monitor, so it is always
+active on the other machine: `bot_monitor` on the bot and `controller_monitor` on the
+controller both log `noise rx <kbps> (loss %)`. That is what actually crossed
+the link. Noise sent from the same machine is ignored. For noise in both directions,
+run `noise` on both machines.
 
-- **noise in one direction**: `noise kbps=...` on the sender, `noise role=sink` on the other machine
-- **noise in both directions**: `noise kbps=...` on both machines (each is also the other's sink)
-
-Every 2 s each node logs what it sent, how many remote receivers it has, and what it
-received from the other machine, with loss. A node ignores its own messages.
-`receivers 0` means nothing is going on the network.
+`noise` logs the rate it hands to ROS. If nothing on the ROS graph subscribes
+(link monitor or bridge not running), it warns that nothing leaves the machine.

@@ -106,6 +106,7 @@ class LaserProcessor(Node):
         self.scan_status = 'none'       # 'none' | 'empty' | 'invalid' | 'ok'
         self.scan_detail = ''
         self.link_seen = False
+        self.noise_kbps = self.noise_loss = 0.0   # noise from the bot (noise.py there)
         self.current_N = 1
         self._last_sent_brake = None    # last command sent, to log only on changes
         self.rear_min_cm = float('inf')  # closest object behind (for reversing in AUTO mode)
@@ -201,6 +202,7 @@ class LaserProcessor(Node):
         loss rises towards 1 (counted per missed period), so current_N grows.
         """
         self.link_seen = True
+        self.noise_kbps, self.noise_loss = s.noise_kbps, s.noise_loss
         self.p_tx, self.p_rx, self.pe2e = s.p_tx, s.p_rx, s.p_e2e
         self.tau_tx = s.tau_tx
         if usePingTauRX:
@@ -369,7 +371,8 @@ class LaserProcessor(Node):
             log.info(f'NET      | tau tx {self.tau_tx:5.1f} rx {self.tau_rx:5.1f} '
                      f'e2e {self.taue2e:5.1f} ms | '
                      f'p tx {self.p_tx * 100:4.1f}% rx {self.p_rx * 100:4.1f}% '
-                     f'e2e {self.pe2e * 100:4.1f}%')
+                     f'e2e {self.pe2e * 100:4.1f}% | noise rx {self.noise_kbps:.0f} kbps '
+                     f'(loss {self.noise_loss * 100:.1f}%)')
 
         # 2. Distance
         if self.scan_status == 'none':
