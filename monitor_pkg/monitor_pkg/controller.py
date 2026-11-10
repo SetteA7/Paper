@@ -2,6 +2,7 @@ import bisect
 import csv
 import os
 import sys
+import time
 from collections import deque
 from datetime import datetime
 
@@ -28,7 +29,11 @@ DEFAULT_RUNS = 1        # runs when RUNS= is not given (each run returns to the 
 # Threshold mode (flags FIXED | SMART | SUPERSMART):
 #   FIXED       S = SAFE_THRESHOLD
 #   SMART       S_high: budget T*(N*+1), safe for any waits (conservative)
-#   SUPERSMART  S_smart: budget B_min, lowest S with exact P_crash <= P_TARGET
+#   SUPERSMART  S_smart: budget B_min, lowest S with exact P_crash <= P_TARGET, given the
+#               measured psi (thesis 5.7)
+# psi = wait from a scan reaching the controller to the control tick (timer, period T)
+# that sends the command. Measured here on every tick; it enters the budget
+# B = dt - tau_e2e - psi of SUPERSMART and of the logged P_crash (all modes).
 DEFAULT_MODE = 'FIXED'
 MODES = ('FIXED', 'SMART', 'SUPERSMART')
 ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
@@ -67,6 +72,12 @@ class LaserProcessor(Node):
     STATUS_PERIOD = 1.0             # s, period of the LIDAR + NET status log
     SCAN_TAU_WINDOW = 100           # scans in the median for tau_rx when usePingTauRX = False
 
+    # --- psi: wait from scan arrival to the control tick that sends the command ---
+    PSI_WINDOW = 50                 # psi samples kept, one per control tick (5 s)
+    PSI_QUANTILE = 0.9              # psi used by the model: this quantile of the window. High,
+                                    # so if jitter makes psi wrap around a tick, the late case counts
+    PSI_MIN_SAMPLES = 10            # fewer samples than this: use psi = T (worst case)
+
     # --- AUTO test mode (RUNS=n on the command line, see AutoTest) ---
     CRASH_DIST_CM = BOT_LENGTH      # lidar reading at/below this = crash (lidar -> front bumper)
     STOP_SETTLE_S = 2.0             # after the brake: wait, then measure where the bot stopped
@@ -100,7 +111,7 @@ class LaserProcessor(Node):
     def __init__(self, mode: str = DEFAULT_MODE, log_csv: bool = ENABLE_CSV, runs: int = 0):
         super().__init__('laser_processor')
         self.mode = mode
-        self.budget_ms = 0.0            # B = dt - tau_e2e for the current threshold
+        self.budget_ms = 0.0            # B = dt - tau_e2e - psi for the current threshold
         self.p_crash = 1.0              # exact crash probability at the current threshold
         self.target_reached = True      # SUPERSMART: False if P_TARGET is unreachable
 
@@ -120,6 +131,12 @@ class LaserProcessor(Node):
         self.scan_delays = deque(maxlen=self.SCAN_TAU_WINDOW)  # ms, arrival - header.stamp
         self.wall_yaw = None            # rad, yaw error w.r.t. the wall normal (+ = turn left)
         self.recent_yaws = deque(maxlen=3)
+
+        # --- psi (controller clock only, no sync needed) ---
+        self.psi_samples = deque(maxlen=self.PSI_WINDOW)  # ms
+        self.psi = float(self.T)        # ms, value used by the model (worst case until measured)
+        self.psi_last = float('nan')    # ms, last sample: wait of the last command sent
+        self._scan_arrival_mono = None  # monotonic ns of the newest scan not yet answered
 
         # --- Network (placeholders until the first heartbeat from the bot) ---
         self.tau_tx = 10
@@ -167,7 +184,7 @@ class LaserProcessor(Node):
         self.csv_writer.writerow([
             'timestamp_lidar', 'timestamp_arrival', 'scan_delay_ms', 'min_distance_cm', 'safe_threshold_cm', 'brake_state',
             'tau_tx_ms', 'tau_rx_ms', 'tau_e2e_ms', 'p_tx', 'p_rx', 'p_e2e',
-            'budget_ms', 'p_crash', 'vmax_cm_s'
+            'budget_ms', 'p_crash', 'vmax_cm_s', 'psi_ms'
         ])
 
     def _write_csv_row(self, lidar_ns: int, arrival_ns: int):
@@ -180,7 +197,7 @@ class LaserProcessor(Node):
             int(self.last_brake_state),
             f"{self.tau_tx:.2f}", f"{self.tau_rx:.2f}", f"{self.taue2e:.2f}",
             f"{self.p_tx:.4f}", f"{self.p_rx:.4f}", f"{self.pe2e:.4f}",
-            f"{self.budget_ms:.2f}", f"{self.p_crash:.6f}", f"{self.VMAX:.2f}"
+            f"{self.budget_ms:.2f}", f"{self.p_crash:.6f}", f"{self.VMAX:.2f}", f"{self.psi:.2f}"
         ])
 
     def close_csv_run(self):
@@ -222,11 +239,11 @@ class LaserProcessor(Node):
         return v_cm_per_ms * time_buffer + self.BOT_LENGTH + self.M + self.D_BRAKE
 
     def _supersmart_threshold(self) -> float:
-        """S_smart = vmax/1000 * (B_min + tau_e2e) + L + m + d_brake (thesis 4.7)."""
+        """S_smart = vmax/1000 * (B_min + tau_e2e + psi) + L + m + d_brake (thesis 5.7)."""
         B, self.target_reached = crash_model.b_min(
             self.T, self.p_tx, self.p_rx, self.P_TARGET, self.N_MAX)
         return crash_model.threshold_from_budget(
-            B, self.taue2e, self.VMAX, self.BOT_LENGTH + self.M + self.D_BRAKE)
+            B, self.taue2e, self.psi, self.VMAX, self.BOT_LENGTH + self.M + self.D_BRAKE)
 
     def _update_threshold(self):
         """Threshold for the current mode, plus the exact P_crash it gives (all modes)."""
@@ -235,10 +252,25 @@ class LaserProcessor(Node):
         elif self.mode == 'SUPERSMART':
             self.safe_threshold = self._supersmart_threshold()
         self.budget_ms = crash_model.budget_from_threshold(
-            self.safe_threshold, self.taue2e, self.VMAX, self.BOT_LENGTH + self.M + self.D_BRAKE)
+            self.safe_threshold, self.taue2e, self.psi, self.VMAX,
+            self.BOT_LENGTH + self.M + self.D_BRAKE)
         self.p_crash = crash_model.p_crash(self.budget_ms, self.T, self.p_tx, self.p_rx)
 
+    def _measure_psi(self):
+        """Called at the start of every control tick: if a scan arrived since the last
+        tick, psi = now - its arrival is the wait of the command sent now.
+        psi is constant while the nodes run (LiDAR and timer both have period T), up to
+        latency jitter; the model uses a high quantile of the last samples."""
+        if self._scan_arrival_mono is None:
+            return
+        self.psi_last = (time.monotonic_ns() - self._scan_arrival_mono) * 1e-6
+        self._scan_arrival_mono = None
+        self.psi_samples.append(self.psi_last)
+        if len(self.psi_samples) >= self.PSI_MIN_SAMPLES:
+            self.psi = float(np.quantile(self.psi_samples, self.PSI_QUANTILE))
+
     def scan_callback(self, msg: LaserScan):
+        self._scan_arrival_mono = time.monotonic_ns()   # for psi (newest scan wins)
         arrival_ns = self.get_clock().now().nanoseconds
         self.last_scan_ns = arrival_ns
         lidar_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
@@ -361,7 +393,7 @@ class LaserProcessor(Node):
         if self.mode == 'SUPERSMART':
             warn = '' if self.target_reached else ', TARGET UNREACHABLE'
             return (f'SUPERSMART thr {self.safe_threshold:5.1f} cm '
-                    f'(B={self.budget_ms:.0f} ms, {pc}{warn})')
+                    f'(B={self.budget_ms:.0f} ms, psi={self.psi:.0f} ms, {pc}{warn})')
         return f'FIXED thr {self.safe_threshold:5.1f} cm ({pc})'
 
     # ---------------------------------------------------------------- Status
@@ -378,6 +410,17 @@ class LaserProcessor(Node):
                      f'e2e {self.taue2e:5.1f} ms | '
                      f'p tx {self.p_tx * 100:4.1f}% rx {self.p_rx * 100:4.1f}% '
                      f'e2e {self.pe2e * 100:4.1f}%')
+        if len(self.psi_samples) < self.PSI_MIN_SAMPLES:
+            log.info(f'PSI      | {len(self.psi_samples)} samples, using T = {self.psi:.0f} ms')
+        else:
+            q10, q50 = np.quantile(self.psi_samples, [0.1, 0.5])
+            line = (f'PSI      | used {self.psi:5.1f} ms (q{self.PSI_QUANTILE * 100:.0f}) | '
+                    f'median {q50:5.1f} | spread q10..q{self.PSI_QUANTILE * 100:.0f} '
+                    f'{self.psi - q10:4.1f} ms')
+            if self.psi - q10 > self.T / 2:
+                log.warn(line + ' | psi wraps around a tick (latency jitter near a tick)')
+            else:
+                log.info(line)
 
         # 2. Distance
         if self.scan_status == 'none':
@@ -410,6 +453,7 @@ class LaserProcessor(Node):
 
     def publish_cmd(self):
         """Control step, every T ms."""
+        self._measure_psi()
         if self.auto is not None:
             self.auto.step()
         else:
@@ -562,6 +606,8 @@ class AutoTest:
         'VMAX_cm_s', 'T_ms', 'D_BRAKE_cm', 'L_cm', 'M_cm', 'V_CMD_cm_s',
         # cruise speed measured in this run (VMAX of the next run), scans it was fitted on
         'v_cruise_cm_s', 'cruise_scans',
+        # psi used by the model at the brake, and the measured wait of the STOP itself
+        'psi_ms_at_brake', 'psi_stop_ms',
     ]
 
     def __init__(self, node: 'LaserProcessor', runs: int):
@@ -714,7 +760,10 @@ class AutoTest:
             v, n_cruise = cruise_speed(t, d, n.CRUISE_FRAC, n.CRUISE_MIN_SCANS)
             self.brake = dict(dist=n.min_dist_cm, thr=n.safe_threshold, N=n.current_N,
                               B=n.budget_ms, pc=n.p_crash,
-                              tau=n.taue2e, p=n.pe2e, v=v, n_cruise=n_cruise)
+                              tau=n.taue2e, p=n.pe2e, v=v, n_cruise=n_cruise,
+                              # psi_last was measured at the start of this tick: the
+                              # wait of the STOP that is being sent now
+                              psi=n.psi, psi_stop=n.psi_last)
             cruise = (f'cruise {v:.2f} cm/s over {n_cruise} scans' if v is not None else
                       f'cruise speed not measured (no steady part of >= '
                       f'{n.CRUISE_MIN_SCANS} scans before the brake)')
@@ -738,6 +787,7 @@ class AutoTest:
             f'{n.VMAX:g}', f'{n.T:g}', f'{n.D_BRAKE:g}', f'{n.BOT_LENGTH:g}', f'{n.M:g}',
             f'{n.LINEAR_SPEED * 100:g}',
             f'{b["v"]:.2f}' if b['v'] is not None else '', b['n_cruise'],
+            f'{b["psi"]:.2f}', f'{b["psi_stop"]:.2f}',
         ])
         self.summary_file.flush()
         n.close_csv_run()
