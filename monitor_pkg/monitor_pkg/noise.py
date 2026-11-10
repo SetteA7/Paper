@@ -64,7 +64,9 @@ class NoiseSender(Node):
     def log(self):
         now = time.monotonic()
         kbps = self.sent_bytes * 8 / 1000 / (now - self.t_log)
-        line = f'sent {kbps:8.1f} kbps'
+        # This is what we hand to ROS, not what crosses the link: that is the
+        # "noise rx" logged by bot_monitor / controller_monitor on the other machine.
+        line = f'published {kbps:8.1f} kbps'
         if self.pub.get_subscription_count() == 0:
             line += ('  <- no subscriber: nothing leaves this machine '
                      '(is bot_monitor / controller_monitor and the bridge running?)')

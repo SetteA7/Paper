@@ -46,7 +46,19 @@ NOISE_TOPIC = 'network_noise'
 NOISE_HEADER = struct.Struct('<IIId')
 NOISE_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                        history=HistoryPolicy.KEEP_LAST, depth=10)
-HOST_ID = zlib.crc32(socket.gethostname().encode())   # noise from this machine is ignored
+
+
+def _machine_key() -> str:
+    """Unique per machine (and boot): the kernel boot id. Hostnames are not enough,
+    cloned robot images all share the same one."""
+    try:
+        with open('/proc/sys/kernel/random/boot_id') as f:
+            return f.read().strip()
+    except OSError:
+        return socket.gethostname()
+
+
+HOST_ID = zlib.crc32(_machine_key().encode())          # noise from this machine is ignored
 NOISE_PERIOD = 2.0                                     # s, rate/loss averaging window
 
 
@@ -68,7 +80,8 @@ class NoiseSink:
     def __init__(self):
         self.kbps = 0.0
         self.loss = 0.0
-        self._bytes = self._msgs = self._lost = 0
+        self.local_kbps = 0.0         # noise from this same machine (ignored, just reported)
+        self._bytes = self._msgs = self._lost = self._local_bytes = 0
         self._expected = {}           # (host, stream) -> next seq
         self._t = time.monotonic()
 
@@ -78,6 +91,7 @@ class NoiseSink:
             return
         host, stream, seq, _ = NOISE_HEADER.unpack_from(data, 0)
         if host == HOST_ID:
+            self._local_bytes += len(data)
             return                    # sent from this machine, did not cross the link
         key = (host, stream)
         exp = self._expected.get(key)
@@ -93,14 +107,19 @@ class NoiseSink:
     def update(self):
         """Every NOISE_PERIOD: rate and loss over the last window."""
         now = time.monotonic()
-        self.kbps = self._bytes * 8 / 1000 / (now - self._t)
+        dt = now - self._t
+        self.kbps = self._bytes * 8 / 1000 / dt
+        self.local_kbps = self._local_bytes * 8 / 1000 / dt
         total = self._msgs + self._lost
         self.loss = self._lost / total if total else 0.0
-        self._bytes = self._msgs = self._lost = 0
+        self._bytes = self._msgs = self._lost = self._local_bytes = 0
         self._t = now
 
     def __str__(self):
-        return f'noise rx {self.kbps:.0f} kbps (loss {self.loss * 100:.1f} %)'
+        s = f'noise rx {self.kbps:.0f} kbps (loss {self.loss * 100:.1f} %)'
+        if self.local_kbps > 0:
+            s += f' [+{self.local_kbps:.0f} kbps from this machine, ignored]'
+        return s
 
 
 class Direction:
