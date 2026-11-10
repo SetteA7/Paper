@@ -352,9 +352,9 @@ class LaserProcessor(Node):
         if self.auto is not None:
             self.auto.on_scan()
 
-        if self.csv_writer is not None:
         # Row held until the tick that answers this scan fills psi_sample_ms
         self._flush_csv_row()                       # previous scan never got a tick of its own
+        if self.csv_writer is not None:
             self._pending_row = self._csv_row(lidar_ns, arrival_ns)
 
     def _fit_wall_yaw(self, ranges: np.ndarray, msg: LaserScan) -> float | None:
