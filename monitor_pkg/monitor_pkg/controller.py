@@ -42,8 +42,9 @@ MODES = ('FIXED', 'SMART', 'SUPERSMART')
 ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
 # Downlink latency tau_rx (bot -> controller):
 #   True:  from the network ping (heartbeat one-way latency, median of the last 100)
-#   False: from the LiDAR scans: arrival time - header.stamp, median of the last
-#          SCAN_TAU_WINDOW scans (includes driver + middleware delay of the real data)
+#   False: from the LiDAR scans: (arrival time - header.stamp) - scan_time, median of the
+#          last SCAN_TAU_WINDOW scans. header.stamp is the start of the scan, so scan_time
+#          (one rotation, msg.scan_time) is the acquisition, not latency, and is removed
 # Loss p_rx and the uplink tau_tx always come from the ping.
 usePingTauRX = True
 CSV_DIR = os.path.expanduser("~/ros2_ws_A7/csv")   # ~ = home of whoever runs it
@@ -141,7 +142,7 @@ class LaserProcessor(Node):
         self._last_sent_brake = None    # last command sent, to log only on changes
         self.rear_min_cm = float('inf')  # closest object behind (for reversing in AUTO mode)
         self.recent_dists = deque(maxlen=5)  # last valid front distances (cm), for medians
-        self.scan_delays = deque(maxlen=self.SCAN_TAU_WINDOW)  # ms, arrival - header.stamp
+        self.scan_delays = deque(maxlen=self.SCAN_TAU_WINDOW)  # ms, arrival - stamp - scan_time
         self.wall_yaw = None            # rad, yaw error w.r.t. the wall normal (+ = turn left)
         self.recent_yaws = deque(maxlen=3)
 
@@ -298,8 +299,9 @@ class LaserProcessor(Node):
         lidar_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
         self.last_lidar_ns = lidar_ns
         if not usePingTauRX:
-            # Downlink latency measured on the real sensor data (needs synced clocks)
-            self.scan_delays.append((arrival_ns - lidar_ns) * 1e-6)
+            # Downlink latency measured on the real sensor data (needs synced clocks):
+            # tau_rx = (now - msg.header.stamp) - scan_time
+            self.scan_delays.append((arrival_ns - lidar_ns) * 1e-6 - msg.scan_time * 1000.0)
             self.tau_rx = float(np.median(self.scan_delays))
             self.taue2e = self.tau_tx + self.tau_rx
 
