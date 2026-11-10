@@ -24,11 +24,8 @@ so tau_e2e = tx + rx is always correct.
 
 `period` and `window` must be the same on both ends.
 """
-import socket
 import statistics
-import struct
 import time
-import zlib
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable
@@ -36,30 +33,7 @@ from typing import Callable
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-from std_msgs.msg import UInt8MultiArray
-
 from link_monitor_msg.msg import LinkState
-
-# --- Noise (see noise.py): every Peer is always a sink for the other machine's noise.
-# Message header: host id, stream id, seq, send time (20 bytes), then random bytes.
-NOISE_TOPIC = 'network_noise'
-NOISE_HEADER = struct.Struct('<IIId')
-NOISE_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
-                       history=HistoryPolicy.KEEP_LAST, depth=10)
-
-
-def _machine_key() -> str:
-    """Unique per machine (and boot): the kernel boot id. Hostnames are not enough,
-    cloned robot images all share the same one."""
-    try:
-        with open('/proc/sys/kernel/random/boot_id') as f:
-            return f.read().strip()
-    except OSError:
-        return socket.gethostname()
-
-
-HOST_ID = zlib.crc32(_machine_key().encode())          # noise from this machine is ignored
-NOISE_PERIOD = 2.0                                     # s, rate/loss averaging window
 
 
 @dataclass(frozen=True)
@@ -70,56 +44,6 @@ class LinkStats:
     p_tx: float     # uplink loss probability
     p_rx: float     # downlink loss probability
     p_e2e: float
-    noise_kbps: float = 0.0   # noise received from the other machine
-    noise_loss: float = 0.0   # its loss (0-1)
-
-
-class NoiseSink:
-    """Counts the noise received from other machines: rate and loss per stream."""
-
-    def __init__(self):
-        self.kbps = 0.0
-        self.loss = 0.0
-        self.local_kbps = 0.0         # noise from this same machine (ignored, just reported)
-        self._bytes = self._msgs = self._lost = self._local_bytes = 0
-        self._expected = {}           # (host, stream) -> next seq
-        self._t = time.monotonic()
-
-    def on_msg(self, msg):
-        data = msg.data
-        if len(data) < NOISE_HEADER.size:
-            return
-        host, stream, seq, _ = NOISE_HEADER.unpack_from(data, 0)
-        if host == HOST_ID:
-            self._local_bytes += len(data)
-            return                    # sent from this machine, did not cross the link
-        key = (host, stream)
-        exp = self._expected.get(key)
-        if exp is None or seq < exp - 100:      # new or restarted sender
-            exp = seq
-        if seq < exp:
-            return                    # late duplicate, already counted lost
-        self._lost += seq - exp
-        self._expected[key] = seq + 1
-        self._msgs += 1
-        self._bytes += len(data)
-
-    def update(self):
-        """Every NOISE_PERIOD: rate and loss over the last window."""
-        now = time.monotonic()
-        dt = now - self._t
-        self.kbps = self._bytes * 8 / 1000 / dt
-        self.local_kbps = self._local_bytes * 8 / 1000 / dt
-        total = self._msgs + self._lost
-        self.loss = self._lost / total if total else 0.0
-        self._bytes = self._msgs = self._lost = self._local_bytes = 0
-        self._t = now
-
-    def __str__(self):
-        s = f'noise rx {self.kbps:.0f} kbps (loss {self.loss * 100:.1f} %)'
-        if self.local_kbps > 0:
-            s += f' [+{self.local_kbps:.0f} kbps from this machine, ignored]'
-        return s
 
 
 class Direction:
@@ -201,12 +125,6 @@ class Peer(Node):
         self.last_msg = None  # last heartbeat from the other end
         self.seq = 0
 
-        # Always-on sink for noise.py running on the other machine (DDS/Zenoh only
-        # send the noise over the link if someone there subscribes).
-        self.noise = NoiseSink()
-        self.create_subscription(UInt8MultiArray, NOISE_TOPIC, self.noise.on_msg, NOISE_QOS)
-        self.create_timer(NOISE_PERIOD, self.noise.update)
-
     def _on_msg(self, msg: LinkState):
         if self.incoming.on_packet(msg.seq, msg.ts_sent, time.time()):
             self.get_logger().info('Other end restarted: link stats reset')
@@ -235,8 +153,7 @@ class NetworkServer(Peer):
 
     def on_period(self):
         self.get_logger().info(
-            f'uplink: lat {self.incoming.latency:.1f} ms | loss {self.incoming.loss * 100:.1f} % | '
-            f'{self.noise}',
+            f'uplink: lat {self.incoming.latency:.1f} ms | loss {self.incoming.loss * 100:.1f} %',
             throttle_duration_sec=2.0,
         )
 
@@ -267,12 +184,10 @@ class NetworkMonitor(Peer):
         if self.log_period:
             self.get_logger().info(
                 f'lat tx/rx/e2e {tau_tx:.1f}/{tau_rx:.1f}/{tau_tx + tau_rx:.1f} ms | '
-                f'loss tx/rx/e2e {p_tx * 100:.1f}/{p_rx * 100:.1f}/{p_e2e * 100:.1f} % | '
-                f'{self.noise}',
+                f'loss tx/rx/e2e {p_tx * 100:.1f}/{p_rx * 100:.1f}/{p_e2e * 100:.1f} %',
                 throttle_duration_sec=self.log_period,
             )
         self.on_update(LinkStats(
             tau_tx=tau_tx, tau_rx=tau_rx, tau_e2e=tau_tx + tau_rx,
             p_tx=p_tx, p_rx=p_rx, p_e2e=p_e2e,
-            noise_kbps=self.noise.kbps, noise_loss=self.noise.loss,
         ))

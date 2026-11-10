@@ -26,7 +26,6 @@ setup(
         'console_scripts': [
             'bot_monitor = monitor_pkg.client:main',
             'controller_monitor = monitor_pkg.controller:main',
-            'noise = monitor_pkg.noise:main',
         ],
     },
 )
