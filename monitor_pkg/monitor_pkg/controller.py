@@ -1,6 +1,7 @@
 import bisect
 import csv
 import os
+import random
 import sys
 import time
 from collections import deque
@@ -86,6 +87,10 @@ class LaserProcessor(Node):
     RETURN_MIN_SPEED = 0.05         # m/s, slowest reverse speed (below this it may not move)
     RETURN_KP = 0.01                # (m/s) per cm still to go while reversing
     RETURN_TOL_CM = 2.0             # start position reached when within this distance
+    # Random start: run k starts at start + START_MARGIN_CM + U(0, VMAX*T) (VMAX*T ~ 4.5 cm,
+    # one LiDAR period of travel), so S is crossed at a uniform phase: phi ~ U(0, T)
+    RANDOM_START = True
+    START_MARGIN_CM = 3.0           # > RETURN_TOL_CM: the bot always reverses to its start (run 1 too)
     RETURN_TIMEOUT_S = 30.0         # abort if the start position is not reached in time
     REAR_STOP_CM = 30.0             # abort reversing if anything is this close behind the lidar
 
@@ -586,6 +591,12 @@ class AutoTest:
       stopping send 0 for STOP_SETTLE_S, then measure where the bot stopped
       return   reverse (forward/backward only) to the start distance
     The start distance is the front distance measured before run 1.
+    Random start (RANDOM_START): each run starts at start + START_MARGIN_CM + U(0, VMAX*T),
+    reached by the return phase (also before run 1). VMAX*T is the travel in one LiDAR
+    period, so the crossing of S falls at a uniform phase of the period and phi is
+    U(0, T) in every run. The return stops within RETURN_TOL_CM of the target, but that
+    error is independent of the random offset, so phi stays uniform. Without it, phi is
+    fixed by the start position and the runs are not independent.
     The session stops after `runs` runs, or at the first crash
     (closest front reading during the run <= CRASH_DIST_CM).
     Cruise speed: at the brake, the speed of the constant-speed part of the approach
@@ -608,6 +619,8 @@ class AutoTest:
         'v_cruise_cm_s', 'cruise_scans',
         # psi used by the model at the brake, and the measured wait of the STOP itself
         'psi_ms_at_brake', 'psi_stop_ms',
+        # start position this run was driven to (start + margin + U(0, VMAX*T) if RANDOM_START)
+        'start_target_cm',
     ]
 
     def __init__(self, node: 'LaserProcessor', runs: int):
@@ -622,6 +635,8 @@ class AutoTest:
         self.results = []               # (run, final_dist, crashed)
         self.align_err = float('nan')   # deg, residual yaw error after aligning
         self.align_ok_since = None
+        self.target = None              # cm, start position of the next run (return phase goal)
+        self.run_target = None          # cm, start position of the current run
         self._enter('align')
 
         mode = node.mode
@@ -665,6 +680,8 @@ class AutoTest:
 
     def status(self) -> str:
         start = f'{self.start_dist:.1f} cm' if self.start_dist is not None else '?'
+        if self.target is not None and self.target != self.start_dist:
+            start += f' (next run from {self.target:.1f} cm)'
         yaw = self.node.wall_yaw
         wall = f'{np.degrees(yaw):+.2f} deg' if yaw is not None else '?'
         return (f'run {self.run}/{self.runs} | phase {self.phase} | start dist {start} | '
@@ -736,12 +753,17 @@ class AutoTest:
         if self.start_dist is None:
             self.start_dist = dist
             self._log().info(f'AUTO | start distance set to {dist:.1f} cm')
+            self._pick_start()
+            if n.RANDOM_START:
+                self._enter('return')   # drive to the random start of run 1 first
+                return
         if dist <= n.safe_threshold:
             self._log().warn(f'AUTO | start {dist:.1f} cm is already below the threshold '
                              f'{n.safe_threshold:.1f} cm: the bot will brake immediately')
 
         self.run += 1
         self.run_start = dist
+        self.run_target = self.target
         self.run_min = float('inf')
         self.track = []
         self.brake = None
@@ -788,6 +810,7 @@ class AutoTest:
             f'{n.LINEAR_SPEED * 100:g}',
             f'{b["v"]:.2f}' if b['v'] is not None else '', b['n_cruise'],
             f'{b["psi"]:.2f}', f'{b["psi_stop"]:.2f}',
+            f'{self.run_target:.2f}' if self.run_target is not None else '',
         ])
         self.summary_file.flush()
         n.close_csv_run()
@@ -809,7 +832,21 @@ class AutoTest:
         if crashed:
             self._finish(f'CRASH in run {self.run}')
         else:
+            self._pick_start()
             self._enter('return')
+
+    def _pick_start(self):
+        """Start position of the next run: start + START_MARGIN_CM + U(0, VMAX*T) with
+        RANDOM_START (VMAX in cm/s, T in ms: VMAX*T/1000 cm = travel in one period),
+        else the start distance itself."""
+        n = self.node
+        if not n.RANDOM_START:
+            self.target = self.start_dist
+            return
+        span = n.VMAX * n.T / 1000.0
+        self.target = self.start_dist + n.START_MARGIN_CM + random.uniform(0.0, span)
+        self._log().info(f'AUTO | next start {self.target:.2f} cm '
+                         f'(start {self.start_dist:.1f} + {n.START_MARGIN_CM:g} + U(0, {span:.2f}))')
 
     def _step_return(self):
         n = self.node
@@ -823,7 +860,7 @@ class AutoTest:
             self._finish(f'obstacle {n.rear_min_cm:.1f} cm behind while reversing '
                          f'(limit REAR_STOP_CM = {self.node.REAR_STOP_CM:.0f} cm)')
             return
-        to_go = self.start_dist - n.min_dist_cm
+        to_go = self.target - n.min_dist_cm
         if to_go <= self.node.RETURN_TOL_CM:
             n.stop_robot()
             if self.run >= self.runs:
