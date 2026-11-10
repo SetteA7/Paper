@@ -38,7 +38,7 @@ ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
 #          SCAN_TAU_WINDOW scans (includes driver + middleware delay of the real data)
 # Loss p_rx and the uplink tau_tx always come from the ping.
 usePingTauRX = True
-CSV_DIR = "/home/user/ros2_ws_A7/csv"
+CSV_DIR = os.path.expanduser("~/ros2_ws_A7/csv")   # ~ = home of whoever runs it
 
 
 class LaserProcessor(Node):
