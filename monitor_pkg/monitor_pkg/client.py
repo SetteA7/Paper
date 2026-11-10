@@ -1,6 +1,7 @@
 # Bot side: run with `ros2 run monitor_pkg bot_monitor`.
 #   - link monitor (heartbeats, latency/loss measurement)
-#   - brake monitor: for each STOP, logs the braking distance measured by the LiDAR
+#   - brake monitor: for each STOP, measures the braking distance with the LiDAR, logs it
+#     and publishes it on BRAKE_TOPIC (the controller uses it as D_BRAKE of the next run)
 from collections import deque
 
 import numpy as np
@@ -8,12 +9,18 @@ import numpy as np
 import rclpy
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 
 from geometry_msgs.msg import TwistStamped
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Float32
 
 from monitor_pkg.network_link import NetworkServer
+
+BRAKE_TOPIC = '/brake_distance'     # std_msgs/Float32, d_brake in cm, one message per STOP
+# One message per brake: reliable, so it is retransmitted instead of lost on a lossy link
+BRAKE_QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                       history=HistoryPolicy.KEEP_LAST, depth=10)
 
 
 class BrakeMonitor(Node):
@@ -38,6 +45,7 @@ class BrakeMonitor(Node):
         super().__init__('brake_monitor')
         self.create_subscription(TwistStamped, '/cmd_vel', self.on_cmd, qos_profile_sensor_data)
         self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
+        self.pub = self.create_publisher(Float32, BRAKE_TOPIC, BRAKE_QOS)
         self.readings = deque(maxlen=50)    # (sample time s, front distance cm)
         self.forward = False                # last command was forward
         self.stop_t = None                  # arrival time (s) of the STOP being measured
@@ -49,6 +57,11 @@ class BrakeMonitor(Node):
     def on_cmd(self, msg: TwistStamped):
         if self.forward and msg.twist.linear.x <= 0.0 and self.stop_t is None:
             self.stop_t = self._now()           # first STOP reached the bot
+        elif msg.twist.linear.x > 0.0 and self.stop_t is not None:
+            # moving again before standing still (e.g. a pause on a stale scan): that
+            # STOP is not a full brake, drop it so the next STOP is measured on its own
+            self.get_logger().warn('BRAKE | forward again before standstill: STOP not measured')
+            self.stop_t = None
         self.forward = msg.twist.linear.x > 0.0
 
     def on_scan(self, msg: LaserScan):
@@ -94,9 +107,11 @@ class BrakeMonitor(Node):
         else:
             self.get_logger().warn('BRAKE | no LiDAR reading before the STOP')
             return
+        d_brake = d_stop - d_still
         self.get_logger().info(f'BRAKE | d(STOP) {d_stop:.2f} cm ({how}) | '
                                f'd(standstill) {d_still:.2f} cm | '
-                               f'd_brake {d_stop - d_still:.2f} cm')
+                               f'd_brake {d_brake:.2f} cm -> {BRAKE_TOPIC}')
+        self.pub.publish(Float32(data=float(d_brake)))
 
 
 def main(args=None):

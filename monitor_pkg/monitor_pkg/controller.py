@@ -17,8 +17,10 @@ from rclpy.utilities import remove_ros_args
 
 from geometry_msgs.msg import TwistStamped
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Float32
 
 from monitor_pkg import crash_model
+from monitor_pkg.client import BRAKE_QOS, BRAKE_TOPIC
 from monitor_pkg.network_link import LinkStats, NetworkMonitor
 
 
@@ -54,13 +56,12 @@ class LaserProcessor(Node):
     # --- Robot parameters (MEASURED IN LAB) ---
     M = 5                           # safety margin (cm)
     BOT_LENGTH = 18.75              # bot length (cm)
-    D_BRAKE = 12.83                  # braking distance (cm)
+    D_BRAKE = 12.33                  # braking distance (cm), AUTO: run 1 only (see DBRAKE_FROM_RUNS)
     VMAX = 43.5                    # max speed (cm/s)
     T = 100                         # control period (ms) SAME AS LIDAR
     SAFE_THRESHOLD = 75             # fixed brake threshold [S] (cm), used when SMART is off
 
-    # NOTE: 0.5 m/s = 50 cm/s is ABOVE VMAX (43.77 cm/s) used for the SMART
-    # threshold. Make sure the two are consistent.
+    # NOTE: 0.5 m/s = 50 cm/s is ABOVE VMAX since actuators don't reach real speed
     LINEAR_SPEED = 0.5              # m/s
 
     # --- Retransmission count N ---
@@ -99,6 +100,13 @@ class LaserProcessor(Node):
     CRUISE_FRAC = 0.9               # cruise = speed >= this fraction of the speed just before the brake
     CRUISE_MIN_SCANS = 4            # fewer cruise scans than this: keep the previous VMAX
     VMAX_MAX_CHANGE = 0.2           # measured speed > 20% away from the current VMAX: not used
+
+    # --- Braking distance (AUTO mode): measured by the bot (client.py, BrakeMonitor) after
+    # each run's brake, received on BRAKE_TOPIC, used as D_BRAKE in the next run ---
+    DBRAKE_FROM_RUNS = True         # False: always use the D_BRAKE constant above
+    DBRAKE_MAX_CHANGE = 0.5         # measured d_brake > 50% away from the current D_BRAKE: not used
+    DBRAKE_WAIT_S = 4.0             # stopping phase waits up to this (s from the STOP) for the bot's
+                                    # value; the bot gives up 3 s after the STOP (client TIMEOUT_S)
 
     # --- Alignment before each AUTO run: turn in place until perpendicular to the wall ---
     ALIGN_ENABLED = True
@@ -157,6 +165,7 @@ class LaserProcessor(Node):
         self.publisher_ = self.create_publisher(TwistStamped, '/cmd_vel', 10)
         self.subscription = self.create_subscription(
             LaserScan, '/scan', self.scan_callback, qos_profile_sensor_data)
+        self.create_subscription(Float32, BRAKE_TOPIC, self.on_brake_distance, BRAKE_QOS)
         self.timer = self.create_timer(self.T / 1000.0, self.publish_cmd)
         self.status_timer = self.create_timer(self.STATUS_PERIOD, self.log_status)
 
@@ -236,6 +245,14 @@ class LaserProcessor(Node):
             self.tau_rx = s.tau_rx
         self.taue2e = self.tau_tx + self.tau_rx
         self.update(s.p_tx, s.p_rx)
+
+    def on_brake_distance(self, msg: Float32):
+        """Braking distance (cm) measured by the bot (client.py) after a STOP."""
+        d = float(msg.data)
+        if self.auto is not None and self.auto.on_brake_distance(d):
+            return                      # belongs to the current run (logged with its result)
+        self.get_logger().info(f'BRAKE    | bot measured d_brake {d:.2f} cm'
+                               + (' (not a run brake: ignored)' if self.auto else ''))
 
     # ----------------------------------------------------------------- Laser
     def _smart_threshold(self) -> float:
@@ -602,6 +619,10 @@ class AutoTest:
     Cruise speed: at the brake, the speed of the constant-speed part of the approach
     is measured (see cruise_speed) and, with VMAX_FROM_RUNS, used as VMAX from the
     next run on. Run 1 uses the VMAX constant.
+    Braking distance: after the brake the bot (client.py) measures d_brake with its LiDAR
+    and publishes it on BRAKE_TOPIC; the stopping phase waits for it (up to DBRAKE_WAIT_S)
+    and, with DBRAKE_FROM_RUNS, it is used as D_BRAKE from the next run on. Run 1 uses the
+    D_BRAKE constant.
 
     Output in CSV_DIR/auto_<mode>_<time>/:
       run_001.csv ...  same columns as the manual CSV, approach + stopping only
@@ -621,6 +642,8 @@ class AutoTest:
         'psi_ms_at_brake', 'psi_stop_ms',
         # start position this run was driven to (start + margin + U(0, VMAX*T) if RANDOM_START)
         'start_target_cm',
+        # braking distance measured by the bot in this run (D_BRAKE of the next run)
+        'd_brake_meas_cm',
     ]
 
     def __init__(self, node: 'LaserProcessor', runs: int):
@@ -637,6 +660,7 @@ class AutoTest:
         self.align_ok_since = None
         self.target = None              # cm, start position of the next run (return phase goal)
         self.run_target = None          # cm, start position of the current run
+        self.d_brake_meas = None        # cm, d_brake the bot measured for this run's brake
         self._enter('align')
 
         mode = node.mode
@@ -688,6 +712,14 @@ class AutoTest:
                 f'wall angle {wall}')
 
     # ---------------------------------------------------------------- hooks
+    def on_brake_distance(self, d: float) -> bool:
+        """d_brake from the bot: kept if it is the brake of the current run (we are in the
+        stopping phase, the only STOP sent there is the run's brake). Returns True if kept."""
+        if self.phase != 'stopping' or self.d_brake_meas is not None:
+            return False
+        self.d_brake_meas = d
+        return True
+
     def on_scan(self):
         """Track the closest front reading while the run is being recorded."""
         if self.phase in ('approach', 'stopping') and self.node.scan_status == 'ok':
@@ -790,6 +822,7 @@ class AutoTest:
                       f'cruise speed not measured (no steady part of >= '
                       f'{n.CRUISE_MIN_SCANS} scans before the brake)')
             self._log().info(f'AUTO | run {self.run} braked ({reason}) | {cruise}')
+            self.d_brake_meas = None
             self._enter('stopping')
 
     def _step_stopping(self):
@@ -797,6 +830,8 @@ class AutoTest:
         n.stop_robot()
         if self._elapsed() < self.node.STOP_SETTLE_S or not n.scan_fresh_ok():
             return
+        if self.d_brake_meas is None and self._elapsed() < n.DBRAKE_WAIT_S:
+            return                      # the bot's d_brake for this brake is not in yet
         final = self._median_dist()
         crashed = self.run_min <= self.node.CRASH_DIST_CM
         b = self.brake
@@ -811,6 +846,7 @@ class AutoTest:
             f'{b["v"]:.2f}' if b['v'] is not None else '', b['n_cruise'],
             f'{b["psi"]:.2f}', f'{b["psi_stop"]:.2f}',
             f'{self.run_target:.2f}' if self.run_target is not None else '',
+            f'{self.d_brake_meas:.2f}' if self.d_brake_meas is not None else '',
         ])
         self.summary_file.flush()
         n.close_csv_run()
@@ -825,9 +861,24 @@ class AutoTest:
             else:
                 self._log().info(f'AUTO | VMAX for the next run: {v:.2f} cm/s (was {n.VMAX:.2f})')
                 n.VMAX = v              # instance value, overrides the class constant
+        if n.DBRAKE_FROM_RUNS:
+            d = self.d_brake_meas
+            if d is None:
+                self._log().warn(f'AUTO | no d_brake from the bot within {n.DBRAKE_WAIT_S:g} s '
+                                 f'(bot_monitor running?): D_BRAKE stays {n.D_BRAKE:.2f} cm')
+            elif d <= 0 or abs(d - n.D_BRAKE) > n.DBRAKE_MAX_CHANGE * n.D_BRAKE:
+                self._log().warn(f'AUTO | measured d_brake {d:.2f} cm is more than '
+                                 f'{n.DBRAKE_MAX_CHANGE:.0%} away from D_BRAKE: not used, '
+                                 f'D_BRAKE stays {n.D_BRAKE:.2f} cm')
+            else:
+                self._log().info(f'AUTO | D_BRAKE for the next run: {d:.2f} cm '
+                                 f'(was {n.D_BRAKE:.2f})')
+                n.D_BRAKE = d           # instance value, overrides the class constant
         self.results.append((self.run, final, crashed))
+        dbm = f'{self.d_brake_meas:.2f} cm' if self.d_brake_meas is not None else '?'
         self._log().info(f'AUTO | run {self.run} result: braked at {b["dist"]:.1f} cm, '
-                         f'stopped at {final:.1f} cm, closest {self.run_min:.1f} cm'
+                         f'stopped at {final:.1f} cm, closest {self.run_min:.1f} cm, '
+                         f'bot d_brake {dbm}'
                          f'{" -> CRASH" if crashed else ""}')
         if crashed:
             self._finish(f'CRASH in run {self.run}')
