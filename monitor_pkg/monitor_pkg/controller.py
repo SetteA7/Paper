@@ -37,6 +37,8 @@ DEFAULT_RUNS = 1        # runs when RUNS= is not given (each run returns to the 
 # psi = wait from a scan reaching the controller to the control tick (timer, period T)
 # that sends the command. Measured here on every tick; it enters the budget
 # B = dt - tau_e2e - psi of SUPERSMART and of the logged P_crash (all modes).
+# CSV: psi_ms = psi used by the model (PSI_QUANTILE of the last PSI_WINDOW waits, nearly
+# constant), psi_sample_ms = the measured wait of the command based on that row's scan.
 DEFAULT_MODE = 'FIXED'
 MODES = ('FIXED', 'SMART', 'SUPERSMART')
 ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
@@ -173,6 +175,7 @@ class LaserProcessor(Node):
         # --- CSV ---
         self.csv_file = None
         self.csv_writer = None
+        self._pending_row = None        # row of the newest scan, written at the tick that answers it
         # AUTO mode opens one CSV per run itself
         self.auto = AutoTest(self, runs) if runs > 0 else None
         if log_csv and self.auto is None:
@@ -199,24 +202,35 @@ class LaserProcessor(Node):
         self.csv_writer.writerow([
             'timestamp_lidar', 'timestamp_arrival', 'scan_delay_ms', 'min_distance_cm', 'safe_threshold_cm', 'brake_state',
             'tau_tx_ms', 'tau_rx_ms', 'tau_e2e_ms', 'p_tx', 'p_rx', 'p_e2e',
-            'budget_ms', 'p_crash', 'vmax_cm_s', 'psi_ms'
+            'budget_ms', 'p_crash', 'vmax_cm_s', 'psi_ms', 'psi_sample_ms'
         ])
 
-    def _write_csv_row(self, lidar_ns: int, arrival_ns: int):
-        """lidar = msg.header.stamp (set by the driver on the bot when the scan was taken),
+    def _csv_row(self, lidar_ns: int, arrival_ns: int) -> list:
+        """Row of one scan, all columns but psi_sample_ms (known only at the next tick).
+        lidar = msg.header.stamp (set by the driver on the bot when the scan was taken),
         arrival = controller clock when the scan reached scan_callback.
-        delay = arrival - lidar; only meaningful if both clocks are synced (chrony)."""
-        self.csv_writer.writerow([
+        delay = arrival - lidar; only meaningful if both clocks are synced (chrony).
+        psi_ms = psi used by the model for this row's budget_ms / p_crash."""
+        return [
             f"{lidar_ns * 1e-9:.4f}", f"{arrival_ns * 1e-9:.4f}",
             f"{(arrival_ns - lidar_ns) * 1e-6:.2f}", f"{self.min_dist_cm:.2f}", f"{self.safe_threshold:.2f}",
             int(self.last_brake_state),
             f"{self.tau_tx:.2f}", f"{self.tau_rx:.2f}", f"{self.taue2e:.2f}",
             f"{self.p_tx:.4f}", f"{self.p_rx:.4f}", f"{self.pe2e:.4f}",
             f"{self.budget_ms:.2f}", f"{self.p_crash:.6f}", f"{self.VMAX:.2f}", f"{self.psi:.2f}"
-        ])
+        ]
+
+    def _flush_csv_row(self, psi_sample: float | None = None):
+        """Write the pending scan row. psi_sample_ms = wait from its arrival to the tick that
+        sent the command based on it (controller clock only); empty if no tick answered it
+        (a newer scan arrived first, or the CSV is being closed)."""
+        row, self._pending_row = self._pending_row, None
+        if row is not None and self.csv_writer is not None:
+            self.csv_writer.writerow(row + [f"{psi_sample:.2f}" if psi_sample is not None else ''])
 
     def close_csv_run(self):
         """Close the current CSV only (AUTO mode: end of a run)."""
+        self._flush_csv_row()
         if self.csv_file is not None and not self.csv_file.closed:
             self.csv_file.flush()
             self.csv_file.close()
@@ -224,6 +238,7 @@ class LaserProcessor(Node):
 
     def close_csv(self):
         """Idempotent: safe to call even if CSV logging is disabled."""
+        self._flush_csv_row()
         if self.csv_file is not None and not self.csv_file.closed:
             self.csv_file.flush()
             self.csv_file.close()
@@ -288,6 +303,7 @@ class LaserProcessor(Node):
             return
         self.psi_last = (time.monotonic_ns() - self._scan_arrival_mono) * 1e-6
         self._scan_arrival_mono = None
+        self._flush_csv_row(self.psi_last)          # that scan's row gets its own wait
         self.psi_samples.append(self.psi_last)
         if len(self.psi_samples) >= self.PSI_MIN_SAMPLES:
             self.psi = float(np.quantile(self.psi_samples, self.PSI_QUANTILE))
@@ -337,7 +353,9 @@ class LaserProcessor(Node):
             self.auto.on_scan()
 
         if self.csv_writer is not None:
-            self._write_csv_row(lidar_ns, arrival_ns)
+        # Row held until the tick that answers this scan fills psi_sample_ms
+        self._flush_csv_row()                       # previous scan never got a tick of its own
+            self._pending_row = self._csv_row(lidar_ns, arrival_ns)
 
     def _fit_wall_yaw(self, ranges: np.ndarray, msg: LaserScan) -> float | None:
         """Yaw error (rad) between the robot heading and the normal of the surface ahead.
