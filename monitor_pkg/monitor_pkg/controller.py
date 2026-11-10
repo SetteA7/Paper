@@ -52,13 +52,12 @@ class LaserProcessor(Node):
     # --- Robot parameters (MEASURED IN LAB) ---
     M = 5                           # safety margin (cm)
     BOT_LENGTH = 18.75              # bot length (cm)
-    D_BRAKE = 12.59                  # braking distance (cm)
-    VMAX = 43.84                    # max speed (cm/s)
+    D_BRAKE = 14.42                 # braking distance (cm)
+    VMAX = 44.91                    # max speed (cm/s)
     T = 100                         # control period (ms) SAME AS LIDAR
     SAFE_THRESHOLD = 75             # fixed brake threshold [S] (cm), used when SMART is off
 
-    # NOTE: 0.5 m/s = 50 cm/s is ABOVE VMAX (43.77 cm/s) used for the SMART
-    # threshold. Make sure the two are consistent.
+    # NOTE: 0.5 m/s = 50 cm/s is ABOVE VMAX since bot actuators don't reach v_max
     LINEAR_SPEED = 0.5              # m/s
 
     # --- Retransmission count N ---
