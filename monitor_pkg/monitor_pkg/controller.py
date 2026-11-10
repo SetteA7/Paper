@@ -38,6 +38,10 @@ ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
 #          SCAN_TAU_WINDOW scans (includes driver + middleware delay of the real data)
 # Loss p_rx and the uplink tau_tx always come from the ping.
 usePingTauRX = True
+# Velocity command to the bot. The bot (bot_monitor) holds the last value and publishes
+# it on its own /cmd_vel at a fixed period, so network jitter/latency do not change the
+# bot's control period. The controller answers each scan with one command.
+CMD_TOPIC = 'cmd_vel_remote'
 CSV_DIR = os.path.expanduser("~/ros2_ws_A7/csv")   # ~ = home of whoever runs it
 
 
@@ -64,6 +68,7 @@ class LaserProcessor(Node):
 
     # --- Timing ---
     SCAN_TIMEOUT_NS = 500_000_000   # 0.5 s without scans -> brake (lidar dead / driver crashed)
+    STALE_CHECK_PERIOD = 0.1        # s, how often to check for stale scans (then send stop)
     STATUS_PERIOD = 1.0             # s, period of the LIDAR + NET status log
     SCAN_TAU_WINDOW = 100           # scans in the median for tau_rx when usePingTauRX = False
 
@@ -125,10 +130,12 @@ class LaserProcessor(Node):
         # --- ROS I/O ---
         self._msg = TwistStamped()
         self._msg.header.frame_id = "base_link"
-        self.publisher_ = self.create_publisher(TwistStamped, '/cmd_vel', 10)
+        self.publisher_ = self.create_publisher(TwistStamped, CMD_TOPIC, 10)
         self.subscription = self.create_subscription(
             LaserScan, '/scan', self.scan_callback, qos_profile_sensor_data)
-        self.timer = self.create_timer(self.T / 1000.0, self.publish_cmd)
+        # Commands are sent from scan_callback (one per scan). This timer only covers
+        # the case where scans stop arriving: then it keeps sending stop.
+        self.stale_timer = self.create_timer(self.STALE_CHECK_PERIOD, self._stale_watchdog)
         self.status_timer = self.create_timer(self.STATUS_PERIOD, self.log_status)
 
         # --- CSV ---
@@ -275,6 +282,9 @@ class LaserProcessor(Node):
         if self.csv_writer is not None:
             self._write_csv_row(lidar_ns, arrival_ns)
 
+        # Answer this scan immediately with the velocity to hold
+        self.publish_cmd()
+
     def _fit_wall_yaw(self, ranges: np.ndarray, msg: LaserScan) -> float | None:
         """Yaw error (rad) between the robot heading and the normal of the surface ahead.
 
@@ -401,7 +411,7 @@ class LaserProcessor(Node):
         self.publisher_.publish(self._msg)
 
     def publish_cmd(self):
-        """Control step, every T ms."""
+        """Control step: called for every scan, sends the velocity the bot must hold."""
         if self.auto is not None:
             self.auto.step()
         else:
@@ -427,6 +437,15 @@ class LaserProcessor(Node):
 
     def stop_robot(self):
         self._publish_speed(0.0)
+
+    def _stale_watchdog(self):
+        """No scans for SCAN_TIMEOUT: nothing triggers publish_cmd, so send stop here
+        (the bot would otherwise hold the last velocity)."""
+        if self._scan_stale(self.get_clock().now().nanoseconds):
+            if self.auto is None:
+                self.drive_by_decision()    # brakes and logs the reason
+            else:
+                self.stop_robot()
 
     # ------------------------------------------------- Retransmission count N
     def _calculate_P_N(self, N: int, p_tx: float, p_rx: float) -> float:
