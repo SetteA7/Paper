@@ -526,6 +526,8 @@ class AutoTest:
         'tau_e2e_ms_at_brake', 'p_e2e_at_brake', 'final_dist_cm', 'min_dist_cm',
         'stop_distance_cm', 'margin_to_crash_cm', 'crashed', 'mode', 'budget_ms_at_brake',
         'p_crash_at_brake', 'align_err_deg',
+        # robot / model parameters used for this run (constants of LaserProcessor)
+        'VMAX_cm_s', 'T_ms', 'D_BRAKE_cm', 'L_cm', 'M_cm', 'V_CMD_cm_s',
     ]
 
     def __init__(self, node: 'LaserProcessor', runs: int):
@@ -688,6 +690,8 @@ class AutoTest:
             f'{final:.2f}', f'{self.run_min:.2f}', f'{b["dist"] - final:.2f}',
             f'{self.run_min - self.node.CRASH_DIST_CM:.2f}', int(crashed),
             n.mode, f'{b["B"]:.2f}', f'{b["pc"]:.6f}', f'{self.align_err:+.3f}',
+            f'{n.VMAX:g}', f'{n.T:g}', f'{n.D_BRAKE:g}', f'{n.BOT_LENGTH:g}', f'{n.M:g}',
+            f'{n.LINEAR_SPEED * 100:g}',
         ])
         self.summary_file.flush()
         n.close_csv_run()
