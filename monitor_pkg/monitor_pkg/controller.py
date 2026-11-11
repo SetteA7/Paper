@@ -65,7 +65,7 @@ CSV_DIR = os.path.expanduser("~/ros2_ws_A7/csv")   # ~ = home of whoever runs it
 # back; never in the calibration run 0. BOT=<address> overrides LOAD_BOT_HOST: the bot's
 # address as this machine reaches it (e.g. the one the zenoh bridge connects to).
 DEFAULT_KBPS = 0
-LOAD_BOT_HOST = ''
+LOAD_BOT_HOST = '100.79.118.80'
 
 
 class LaserProcessor(Node):
