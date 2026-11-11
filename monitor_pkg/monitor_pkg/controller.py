@@ -27,7 +27,7 @@ from monitor_pkg.network_link import LinkStats, NetworkMonitor, SeqLoss
 # ============================================================== TOGGLES
 # Defaults; override at launch: ros2 run monitor_pkg controller_monitor SUPERSMART NOCSV
 # Automated test: ros2 run monitor_pkg controller_monitor SMART RUNS=20  (see AutoTest)
-#   = calibration run 0 (measures VMAX and D_BRAKE, see CALIBRATION_RUN) + runs 1..20
+#   = calibration run 0 (FIXED mode, measures VMAX and D_BRAKE, see CALIBRATION_RUN) + runs 1..20
 # Old open-ended mode (drive/brake until Ctrl+C, no return): ... controller_monitor MANUAL
 DEFAULT_RUNS = 1        # runs when RUNS= is not given (each run returns to the start)
 # Threshold mode (flags FIXED | SMART | SUPERSMART):
@@ -108,9 +108,10 @@ class LaserProcessor(Node):
     REAR_STOP_CM = 30.0             # abort reversing if anything is this close behind the lidar
 
     # --- Calibration (AUTO mode): before the n runs, a run 0 measures the cruise speed and
-    # the bot's d_brake and sets VMAX and D_BRAKE; runs 1..n use them unchanged. Run 0 uses
-    # the constants above, needs both values (else the session ends), and is logged as
-    # run 0 (run_000.csv, run = 0 in summary.csv): drop it from the analysis ---
+    # the bot's d_brake and sets VMAX and D_BRAKE; runs 1..n use them unchanged. Run 0 always
+    # brakes in FIXED mode (S = SAFE_THRESHOLD, whatever the session mode), uses the
+    # constants above, needs both values (else the session ends), and is logged as
+    # run 0 (run_000.csv, run = 0 and mode = FIXED in summary.csv): drop it from the analysis ---
     CALIBRATION_RUN = True          # False: no run 0; VMAX_FROM_RUNS / DBRAKE_FROM_RUNS
                                     # update the values after every run instead
 
@@ -206,10 +207,11 @@ class LaserProcessor(Node):
             self._open_csv()
 
         self.get_logger().info(
-            f'START | mode {self.mode} | model downlink tau/p from {self.tau_source} | '
+            f'START | mode {mode} | model downlink tau/p from {self.tau_source} | '
             f'CSV {self.csv_file.name if self.csv_file else "OFF"} | '
             f'speed {self.LINEAR_SPEED} m/s'
-            + (f' | AUTO {"calibration run 0 + " if self.CALIBRATION_RUN else ""}{runs} runs '
+            + (f' | AUTO {"calibration run 0 (FIXED) + " if self.CALIBRATION_RUN else ""}'
+               f'{runs} runs '
                f'-> {self.auto.session_dir}' if self.auto else ''))
 
     @property
@@ -347,6 +349,8 @@ class LaserProcessor(Node):
             self.safe_threshold = self._smart_threshold()
         elif self.mode == 'SUPERSMART':
             self.safe_threshold = self._supersmart_threshold()
+        else:
+            self.safe_threshold = self.SAFE_THRESHOLD
         self.budget_ms = crash_model.budget_from_threshold(
             self.safe_threshold, self.tau_e2e_model, self.psi, self.VMAX,
             self.BOT_LENGTH + self.M + self.D_BRAKE)
@@ -713,7 +717,8 @@ class AutoTest:
     is measured (see cruise_speed).
     Braking distance: after the brake the bot (client.py) measures d_brake with its LiDAR
     and publishes it on BRAKE_TOPIC; the stopping phase waits for it (up to DBRAKE_WAIT_S).
-    Calibration (CALIBRATION_RUN): a run 0 before the `runs` runs, same procedure, uses the
+    Calibration (CALIBRATION_RUN): a run 0 before the `runs` runs, same procedure, always in
+    FIXED mode (S = SAFE_THRESHOLD; the session mode is set back after it), uses the
     VMAX and D_BRAKE constants; its cruise speed and d_brake become VMAX and D_BRAKE of
     runs 1..n, which then stay fixed (both must be measured and pass the *_MAX_CHANGE
     checks, else the session ends). Without it, VMAX_FROM_RUNS / DBRAKE_FROM_RUNS update
@@ -765,6 +770,9 @@ class AutoTest:
         self._enter('align')
 
         mode = node.mode
+        self.session_mode = mode        # mode of runs 1..n
+        if self.calibration:
+            node.mode = 'FIXED'         # run 0 (and the phases before it) in FIXED mode
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.session_dir = os.path.join(CSV_DIR, f'auto_{mode}_{ts}')
         os.makedirs(self.session_dir, exist_ok=True)
@@ -974,6 +982,9 @@ class AutoTest:
                          'running? start far enough to reach cruise speed?) or the VMAX / '
                          'D_BRAKE constants, then restart')
         else:
+            if n.mode != self.session_mode:
+                n.mode = self.session_mode  # end of the FIXED calibration run 0
+                self._log().info(f'AUTO | runs 1-{self.runs} in {n.mode} mode')
             self._pick_start()          # after _update_params: the span uses the new VMAX
             self._enter('return')
 

@@ -175,7 +175,7 @@ The network monitor nodes accept ROS parameters, which must be the same on both 
 `--ros-args -p window:=200`.
 
 The startup line shows the active configuration, for example
-`START | mode SUPERSMART | model tau_rx from PING | ... | AUTO calibration run 0 + 20 runs`.
+`START | mode SUPERSMART | model downlink tau/p from PING | ... | AUTO calibration run 0 (FIXED) + 20 runs`.
 
 ---
 
@@ -191,12 +191,14 @@ Each run goes through five phases:
 5. **return**: reverse to the start position of the next run.
 
 **Calibration run 0** (`CALIBRATION_RUN = True`):
+- Run 0 always brakes in **FIXED** mode (S = `SAFE_THRESHOLD`), whatever the session mode,
+  so the calibration does not depend on the model. Runs 1..n use the session mode.
 - Run 0 uses the `VMAX` and `D_BRAKE` constants.
 - Its measured cruise speed and d_brake become VMAX and D_BRAKE for runs 1..n, which then
   stay fixed.
 - Both values must be measured and fall within 20% (VMAX) and 50% (D_BRAKE) of the
   constants, otherwise the session ends.
-- Run 0 is logged as `run_000.csv` and `run = 0` in `summary.csv`. **Leave it out of the
+- Run 0 is logged as `run_000.csv` and `run = 0`, `mode = FIXED` in `summary.csv`. **Leave it out of the
   analysis.**
 - With `CALIBRATION_RUN = False`, VMAX and D_BRAKE are instead updated after every run
   (`VMAX_FROM_RUNS`, `DBRAKE_FROM_RUNS`).
