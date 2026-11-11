@@ -27,6 +27,7 @@ from monitor_pkg.network_link import LinkStats, NetworkMonitor
 # ============================================================== TOGGLES
 # Defaults; override at launch: ros2 run monitor_pkg controller_monitor SUPERSMART NOCSV
 # Automated test: ros2 run monitor_pkg controller_monitor SMART RUNS=20  (see AutoTest)
+#   = calibration run 0 (measures VMAX and D_BRAKE, see CALIBRATION_RUN) + runs 1..20
 # Old open-ended mode (drive/brake until Ctrl+C, no return): ... controller_monitor MANUAL
 DEFAULT_RUNS = 1        # runs when RUNS= is not given (each run returns to the start)
 # Threshold mode (flags FIXED | SMART | SUPERSMART):
@@ -59,8 +60,8 @@ class LaserProcessor(Node):
     # --- Robot parameters (MEASURED IN LAB) ---
     M = 5                           # safety margin (cm)
     BOT_LENGTH = 18.75              # bot length (cm)
-    D_BRAKE = 12.33                  # braking distance (cm), AUTO: run 1 only (see DBRAKE_FROM_RUNS)
-    VMAX = 43.5                    # max speed (cm/s)
+    D_BRAKE = 12.33                  # braking distance (cm), AUTO: run 0 only (see CALIBRATION_RUN)
+    VMAX = 43.5                    # max speed (cm/s), AUTO: run 0 only (see CALIBRATION_RUN)
     T = 100                         # control period (ms) SAME AS LIDAR
     SAFE_THRESHOLD = 75             # fixed brake threshold [S] (cm), used when SMART is off
 
@@ -98,15 +99,22 @@ class LaserProcessor(Node):
     RETURN_TIMEOUT_S = 30.0         # abort if the start position is not reached in time
     REAR_STOP_CM = 30.0             # abort reversing if anything is this close behind the lidar
 
-    # --- Cruise speed (AUTO mode): measured in each run, used as VMAX in the next one ---
-    VMAX_FROM_RUNS = True           # False: always use the VMAX constant above
+    # --- Calibration (AUTO mode): before the n runs, a run 0 measures the cruise speed and
+    # the bot's d_brake and sets VMAX and D_BRAKE; runs 1..n use them unchanged. Run 0 uses
+    # the constants above, needs both values (else the session ends), and is logged as
+    # run 0 (run_000.csv, run = 0 in summary.csv): drop it from the analysis ---
+    CALIBRATION_RUN = True          # False: no run 0; VMAX_FROM_RUNS / DBRAKE_FROM_RUNS
+                                    # update the values after every run instead
+
+    # --- Cruise speed (AUTO mode): measured in each run (logged), see CALIBRATION_RUN ---
+    VMAX_FROM_RUNS = True           # without CALIBRATION_RUN: VMAX of the next run (False: constant)
     CRUISE_FRAC = 0.9               # cruise = speed >= this fraction of the speed just before the brake
-    CRUISE_MIN_SCANS = 4            # fewer cruise scans than this: keep the previous VMAX
+    CRUISE_MIN_SCANS = 4            # fewer cruise scans than this: speed not measured
     VMAX_MAX_CHANGE = 0.2           # measured speed > 20% away from the current VMAX: not used
 
     # --- Braking distance (AUTO mode): measured by the bot (client.py, BrakeMonitor) after
-    # each run's brake, received on BRAKE_TOPIC, used as D_BRAKE in the next run ---
-    DBRAKE_FROM_RUNS = True         # False: always use the D_BRAKE constant above
+    # each run's brake, received on BRAKE_TOPIC (logged), see CALIBRATION_RUN ---
+    DBRAKE_FROM_RUNS = True         # without CALIBRATION_RUN: D_BRAKE of the next run (False: constant)
     DBRAKE_MAX_CHANGE = 0.5         # measured d_brake > 50% away from the current D_BRAKE: not used
     DBRAKE_WAIT_S = 4.0             # stopping phase waits up to this (s from the STOP) for the bot's
                                     # value; the bot gives up 3 s after the STOP (client TIMEOUT_S)
@@ -185,7 +193,8 @@ class LaserProcessor(Node):
             f'START | mode {self.mode} | tau_rx from {"PING" if usePingTauRX else "LIDAR"} | '
             f'CSV {self.csv_file.name if self.csv_file else "OFF"} | '
             f'speed {self.LINEAR_SPEED} m/s'
-            + (f' | AUTO {runs} runs -> {self.auto.session_dir}' if self.auto else ''))
+            + (f' | AUTO {"calibration run 0 + " if self.CALIBRATION_RUN else ""}{runs} runs '
+               f'-> {self.auto.session_dir}' if self.auto else ''))
 
     @property
     def finished(self) -> bool:
@@ -637,16 +646,19 @@ class AutoTest:
     The session stops after `runs` runs, or at the first crash
     (closest front reading during the run <= CRASH_DIST_CM).
     Cruise speed: at the brake, the speed of the constant-speed part of the approach
-    is measured (see cruise_speed) and, with VMAX_FROM_RUNS, used as VMAX from the
-    next run on. Run 1 uses the VMAX constant.
+    is measured (see cruise_speed).
     Braking distance: after the brake the bot (client.py) measures d_brake with its LiDAR
-    and publishes it on BRAKE_TOPIC; the stopping phase waits for it (up to DBRAKE_WAIT_S)
-    and, with DBRAKE_FROM_RUNS, it is used as D_BRAKE from the next run on. Run 1 uses the
-    D_BRAKE constant.
+    and publishes it on BRAKE_TOPIC; the stopping phase waits for it (up to DBRAKE_WAIT_S).
+    Calibration (CALIBRATION_RUN): a run 0 before the `runs` runs, same procedure, uses the
+    VMAX and D_BRAKE constants; its cruise speed and d_brake become VMAX and D_BRAKE of
+    runs 1..n, which then stay fixed (both must be measured and pass the *_MAX_CHANGE
+    checks, else the session ends). Without it, VMAX_FROM_RUNS / DBRAKE_FROM_RUNS update
+    them after every run instead. Every run logs its own measured values in the summary.
 
     Output in CSV_DIR/auto_<mode>_<time>/:
+      run_000.csv      calibration run (CALIBRATION_RUN)
       run_001.csv ...  same columns as the manual CSV, approach + stopping only
-      summary.csv      one row per run
+      summary.csv      one row per run (run 0 = calibration)
     """
 
     SUMMARY_HEADER = [
@@ -656,20 +668,22 @@ class AutoTest:
         'p_crash_at_brake', 'align_err_deg',
         # robot / model parameters used for this run (constants of LaserProcessor)
         'VMAX_cm_s', 'T_ms', 'D_BRAKE_cm', 'L_cm', 'M_cm', 'V_CMD_cm_s',
-        # cruise speed measured in this run (VMAX of the next run), scans it was fitted on
+        # cruise speed measured in this run, scans it was fitted on (VMAX of runs 1..n if
+        # this is the calibration run 0)
         'v_cruise_cm_s', 'cruise_scans',
         # psi used by the model at the brake, and the measured wait of the STOP itself
         'psi_ms_at_brake', 'psi_stop_ms',
         # start position this run was driven to (start + margin + U(0, VMAX*T) if RANDOM_START)
         'start_target_cm',
-        # braking distance measured by the bot in this run (D_BRAKE of the next run)
+        # braking distance measured by the bot in this run (D_BRAKE of runs 1..n if run 0)
         'd_brake_meas_cm',
     ]
 
     def __init__(self, node: 'LaserProcessor', runs: int):
         self.node = node
-        self.runs = runs
-        self.run = 0
+        self.runs = runs                # measured runs 1..runs
+        self.calibration = node.CALIBRATION_RUN
+        self.run = -1 if self.calibration else 0   # +1 when a run starts: run 0 = calibration
         self.finished = False
         self.start_dist = None
         self.brake = None               # values recorded at the brake decision
@@ -713,9 +727,16 @@ class AutoTest:
         self.node.stop_robot()
         self.node.close_csv()           # closes the run CSV and the summary
         self.finished = True
+        done = sum(1 for r, _, _ in self.results if r > 0)
         crashes = sum(1 for _, _, c in self.results if c)
-        self._log().info(f'AUTO DONE | {why} | {len(self.results)} runs, {crashes} crash(es) | '
+        cal = ' + calibration' if any(r == 0 for r, _, _ in self.results) else ''
+        self._log().info(f'AUTO DONE | {why} | {done} runs{cal}, {crashes} crash(es) | '
                          f'results in {self.session_dir}')
+
+    def _run_name(self) -> str:
+        if self.calibration and self.run <= 0:
+            return 'run 0 (calibration)'
+        return f'run {self.run}/{self.runs}'
 
     def close(self):
         if not self.summary_file.closed:
@@ -728,7 +749,7 @@ class AutoTest:
             start += f' (next run from {self.target:.1f} cm)'
         yaw = self.node.wall_yaw
         wall = f'{np.degrees(yaw):+.2f} deg' if yaw is not None else '?'
-        return (f'run {self.run}/{self.runs} | phase {self.phase} | start dist {start} | '
+        return (f'{self._run_name()} | phase {self.phase} | start dist {start} | '
                 f'wall angle {wall}')
 
     # ---------------------------------------------------------------- hooks
@@ -807,7 +828,7 @@ class AutoTest:
             self._log().info(f'AUTO | start distance set to {dist:.1f} cm')
             self._pick_start()
             if n.RANDOM_START:
-                self._enter('return')   # drive to the random start of run 1 first
+                self._enter('return')   # drive to the random start of the first run first
                 return
         if dist <= n.safe_threshold:
             self._log().warn(f'AUTO | start {dist:.1f} cm is already below the threshold '
@@ -821,7 +842,7 @@ class AutoTest:
         self.brake = None
         n._open_csv(os.path.join(self.session_dir, f'run_{self.run:03d}.csv'))
         n._last_sent_brake = None       # log the first command of the run
-        self._log().info(f'AUTO | ===== run {self.run}/{self.runs} start ({dist:.1f} cm) =====')
+        self._log().info(f'AUTO | ===== {self._run_name()} start ({dist:.1f} cm) =====')
         self._enter('approach')
 
     def _step_approach(self):
@@ -870,41 +891,66 @@ class AutoTest:
         ])
         self.summary_file.flush()
         n.close_csv_run()
-        if n.VMAX_FROM_RUNS:
-            v = b['v']
-            if v is None:
-                self._log().warn(f'AUTO | cruise speed not measured: VMAX stays {n.VMAX:.2f} cm/s')
-            elif abs(v - n.VMAX) > n.VMAX_MAX_CHANGE * n.VMAX:
-                self._log().warn(f'AUTO | cruise speed {v:.2f} cm/s is more than '
-                                 f'{n.VMAX_MAX_CHANGE:.0%} away from VMAX: not used, '
-                                 f'VMAX stays {n.VMAX:.2f} cm/s')
-            else:
-                self._log().info(f'AUTO | VMAX for the next run: {v:.2f} cm/s (was {n.VMAX:.2f})')
-                n.VMAX = v              # instance value, overrides the class constant
-        if n.DBRAKE_FROM_RUNS:
-            d = self.d_brake_meas
-            if d is None:
-                self._log().warn(f'AUTO | no d_brake from the bot within {n.DBRAKE_WAIT_S:g} s '
-                                 f'(bot_monitor running?): D_BRAKE stays {n.D_BRAKE:.2f} cm')
-            elif d <= 0 or abs(d - n.D_BRAKE) > n.DBRAKE_MAX_CHANGE * n.D_BRAKE:
-                self._log().warn(f'AUTO | measured d_brake {d:.2f} cm is more than '
-                                 f'{n.DBRAKE_MAX_CHANGE:.0%} away from D_BRAKE: not used, '
-                                 f'D_BRAKE stays {n.D_BRAKE:.2f} cm')
-            else:
-                self._log().info(f'AUTO | D_BRAKE for the next run: {d:.2f} cm '
-                                 f'(was {n.D_BRAKE:.2f})')
-                n.D_BRAKE = d           # instance value, overrides the class constant
+        calib_failed = self._update_params(b)
         self.results.append((self.run, final, crashed))
         dbm = f'{self.d_brake_meas:.2f} cm' if self.d_brake_meas is not None else '?'
-        self._log().info(f'AUTO | run {self.run} result: braked at {b["dist"]:.1f} cm, '
+        self._log().info(f'AUTO | {self._run_name()} result: braked at {b["dist"]:.1f} cm, '
                          f'stopped at {final:.1f} cm, closest {self.run_min:.1f} cm, '
                          f'bot d_brake {dbm}'
                          f'{" -> CRASH" if crashed else ""}')
         if crashed:
             self._finish(f'CRASH in run {self.run}')
+        elif calib_failed:
+            self._finish(f'calibration failed: {calib_failed}. Check the setup (bot_monitor '
+                         'running? start far enough to reach cruise speed?) or the VMAX / '
+                         'D_BRAKE constants, then restart')
         else:
-            self._pick_start()
+            self._pick_start()          # after _update_params: the span uses the new VMAX
             self._enter('return')
+
+    def _update_params(self, b: dict) -> str | None:
+        """VMAX and D_BRAKE from the cruise speed and the bot's d_brake measured in this run.
+
+        CALIBRATION_RUN: only run 0 sets them, both are required, and runs 1..n keep them.
+        Returns why the calibration failed, or None.
+        Otherwise (VMAX_FROM_RUNS / DBRAKE_FROM_RUNS) every run updates them for the next
+        one, and a value that can't be used only gives a warning (returns None).
+        """
+        n = self.node
+        calibrating = self.calibration and self.run == 0
+        if self.calibration and not calibrating:
+            return None                 # runs 1..n: the calibrated values stay fixed
+        use = f'runs 1-{self.runs}' if calibrating else 'the next run'
+        problems = []                   # (what went wrong, value kept instead)
+        if calibrating or n.VMAX_FROM_RUNS:
+            v = b['v']
+            keep = f'VMAX stays {n.VMAX:.2f} cm/s'
+            if v is None:
+                problems.append(('cruise speed not measured', keep))
+            elif abs(v - n.VMAX) > n.VMAX_MAX_CHANGE * n.VMAX:
+                problems.append((f'cruise speed {v:.2f} cm/s is more than '
+                                 f'{n.VMAX_MAX_CHANGE:.0%} away from VMAX {n.VMAX:.2f}', keep))
+            else:
+                self._log().info(f'AUTO | VMAX for {use}: {v:.2f} cm/s (was {n.VMAX:.2f})')
+                n.VMAX = v              # instance value, overrides the class constant
+        if calibrating or n.DBRAKE_FROM_RUNS:
+            d = self.d_brake_meas
+            keep = f'D_BRAKE stays {n.D_BRAKE:.2f} cm'
+            if d is None:
+                problems.append((f'no d_brake from the bot within {n.DBRAKE_WAIT_S:g} s '
+                                 '(bot_monitor running?)', keep))
+            elif d <= 0 or abs(d - n.D_BRAKE) > n.DBRAKE_MAX_CHANGE * n.D_BRAKE:
+                problems.append((f'measured d_brake {d:.2f} cm is more than '
+                                 f'{n.DBRAKE_MAX_CHANGE:.0%} away from D_BRAKE {n.D_BRAKE:.2f}',
+                                 keep))
+            else:
+                self._log().info(f'AUTO | D_BRAKE for {use}: {d:.2f} cm (was {n.D_BRAKE:.2f})')
+                n.D_BRAKE = d           # instance value, overrides the class constant
+        if calibrating:
+            return '; '.join(p for p, _ in problems) or None
+        for p, keep in problems:
+            self._log().warn(f'AUTO | {p}: not used, {keep}')
+        return None
 
     def _pick_start(self):
         """Start position of the next run: start + START_MARGIN_CM + U(0, VMAX*T) with
@@ -945,7 +991,8 @@ class AutoTest:
 
 def parse_flags(argv):
     """Command-line toggles, e.g. `ros2 run monitor_pkg controller_monitor SMART NOCSV`.
-    `RUNS=n` runs the automated test (AutoTest) n times (default DEFAULT_RUNS).
+    `RUNS=n` runs the automated test (AutoTest) n times (default DEFAULT_RUNS), after a
+    calibration run 0 if CALIBRATION_RUN.
     `MANUAL` = old open-ended mode: no runs, no return, until Ctrl+C.
     FIXED | SMART | SUPERSMART pick the threshold mode (NOSMART = FIXED).
     Anything not given falls back to DEFAULT_MODE / ENABLE_CSV."""
