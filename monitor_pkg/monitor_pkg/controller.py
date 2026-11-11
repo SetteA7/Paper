@@ -209,12 +209,13 @@ class LaserProcessor(Node):
         self.csv_file = open(path, mode='w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
-            'timestamp_lidar', 'timestamp_arrival', 'scan_delay_ms', 'min_distance_cm', 'safe_threshold_cm', 'brake_state',
+            'timestamp_lidar', 'timestamp_arrival', 'scan_delay_ms', 'scan_time_ms',
+            'min_distance_cm', 'safe_threshold_cm', 'brake_state',
             'tau_tx_ms', 'tau_rx_ms', 'tau_e2e_ms', 'p_tx', 'p_rx', 'p_e2e',
             'budget_ms', 'p_crash', 'vmax_cm_s', 'psi_ms', 'psi_sample_ms'
         ])
 
-    def _csv_row(self, lidar_ns: int, arrival_ns: int) -> list:
+    def _csv_row(self, lidar_ns: int, arrival_ns: int, scan_time_ms: float) -> list:
         """Row of one scan, all columns but psi_sample_ms (known only at the next tick).
         lidar = msg.header.stamp (set by the driver on the bot when the scan was taken),
         arrival = controller clock when the scan reached scan_callback.
@@ -222,7 +223,8 @@ class LaserProcessor(Node):
         psi_ms = psi used by the model for this row's budget_ms / p_crash."""
         return [
             f"{lidar_ns * 1e-9:.4f}", f"{arrival_ns * 1e-9:.4f}",
-            f"{(arrival_ns - lidar_ns) * 1e-6:.2f}", f"{self.min_dist_cm:.2f}", f"{self.safe_threshold:.2f}",
+            f"{(arrival_ns - lidar_ns) * 1e-6:.2f}", f"{scan_time_ms:.2f}",
+            f"{self.min_dist_cm:.2f}", f"{self.safe_threshold:.2f}",
             int(self.last_brake_state),
             f"{self.tau_tx:.2f}", f"{self.tau_rx:.2f}", f"{self.taue2e:.2f}",
             f"{self.p_tx:.4f}", f"{self.p_rx:.4f}", f"{self.pe2e:.4f}",
@@ -364,7 +366,7 @@ class LaserProcessor(Node):
         # Row held until the tick that answers this scan fills psi_sample_ms
         self._flush_csv_row()                       # previous scan never got a tick of its own
         if self.csv_writer is not None:
-            self._pending_row = self._csv_row(lidar_ns, arrival_ns)
+            self._pending_row = self._csv_row(lidar_ns, arrival_ns, msg.scan_time * 1000.0)
 
     def _fit_wall_yaw(self, ranges: np.ndarray, msg: LaserScan) -> float | None:
         """Yaw error (rad) between the robot heading and the normal of the surface ahead.
