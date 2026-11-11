@@ -17,9 +17,9 @@ from rclpy.utilities import remove_ros_args
 
 from geometry_msgs.msg import TwistStamped
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Int32
 
-from monitor_pkg import crash_model
+from monitor_pkg import crash_model, traffic
 from monitor_pkg.client import BRAKE_QOS, BRAKE_TOPIC
 from monitor_pkg.network_link import LinkStats, NetworkMonitor, ScanLoss
 
@@ -59,6 +59,13 @@ ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
 # The uplink loss p_tx and latency tau_tx always come from the ping.
 usePingTauRX = True
 CSV_DIR = os.path.expanduser("~/ros2_ws_A7/csv")   # ~ = home of whoever runs it
+# Link load (traffic.py, iperf3 UDP), AUTO runs only. KBPS=<n>: n kbit/s controller -> bot;
+# the bot -> controller rate is bot_monitor's KBPS=. On from the wait phase before each
+# measured run (LOAD_WARMUP_S at the start), off when the run ends, before the bot drives
+# back; never in the calibration run 0. BOT=<address> overrides LOAD_BOT_HOST: the bot's
+# address as this machine reaches it (e.g. the one the zenoh bridge connects to).
+DEFAULT_KBPS = 0
+LOAD_BOT_HOST = ''
 
 
 class LaserProcessor(Node):
@@ -97,6 +104,8 @@ class LaserProcessor(Node):
     CRASH_DIST_CM = BOT_LENGTH      # lidar reading at/below this = crash (lidar -> front bumper)
     STOP_SETTLE_S = 2.0             # after the brake: wait, then measure where the bot stopped
     START_SETTLE_S = 2.0            # standstill at the start position before each run
+    LOAD_WARMUP_S = 10.0            # with link load: standstill under load before each run,
+                                    # so the heartbeat and scan windows (10 s) see the load
     RETURN_SPEED = 0.2              # m/s, max reverse speed when going back to the start
     RETURN_MIN_SPEED = 0.05         # m/s, slowest reverse speed (below this it may not move)
     RETURN_KP = 0.01                # (m/s) per cm still to go while reversing
@@ -143,8 +152,11 @@ class LaserProcessor(Node):
     ALIGN_SIGN = 1                  # set to -1 if the bot turns AWAY from perpendicular
 
     def __init__(self, mode: str = DEFAULT_MODE, log_csv: bool = ENABLE_CSV, runs: int = 0,
-                 use_ping: bool = usePingTauRX):
+                 use_ping: bool = usePingTauRX, kbps: int = DEFAULT_KBPS,
+                 bot_host: str = LOAD_BOT_HOST):
         super().__init__('laser_processor')
+        # Link load: tx = our KBPS, rx = bot_monitor's (RATE_TOPIC); started by AutoTest
+        self.load = traffic.LoadClients(bot_host, kbps)
         self.mode = mode
         self.use_ping = use_ping        # downlink tau of the model: ping (True) or scans
         self.budget_ms = 0.0            # B = dt - tau_e2e - psi for the current threshold
@@ -194,6 +206,7 @@ class LaserProcessor(Node):
         self.subscription = self.create_subscription(
             LaserScan, '/scan', self.scan_callback, qos_profile_sensor_data)
         self.create_subscription(Float32, BRAKE_TOPIC, self.on_brake_distance, BRAKE_QOS)
+        self.create_subscription(Int32, traffic.RATE_TOPIC, self.on_bot_kbps, traffic.RATE_QOS)
         self.timer = self.create_timer(self.T / 1000.0, self.publish_cmd)
         self.status_timer = self.create_timer(self.STATUS_PERIOD, self.log_status)
 
@@ -212,7 +225,11 @@ class LaserProcessor(Node):
             f'speed {self.LINEAR_SPEED} m/s'
             + (f' | AUTO {"calibration run 0 (FIXED) + " if self.CALIBRATION_RUN else ""}'
                f'{runs} runs '
-               f'-> {self.auto.session_dir}' if self.auto else ''))
+               f'-> {self.auto.session_dir}' if self.auto else '')
+            + f' | load controller -> bot {kbps} kbit/s')
+        if kbps > 0 and self.auto is None:
+            self.get_logger().warn('LOAD     | the link load runs only in AUTO runs: '
+                                   'KBPS ignored in MANUAL mode')
 
     @property
     def finished(self) -> bool:
@@ -321,6 +338,13 @@ class LaserProcessor(Node):
         self.tau_rx = s.tau_rx
         self.taue2e = self.tau_tx + self.tau_rx
         self.update(self.p_tx, self.p_rx_model)
+
+    def on_bot_kbps(self, msg: Int32):
+        """bot_monitor's KBPS (bot -> controller load), latched: used from the next run."""
+        if msg.data != self.load.rx_kbps:
+            self.get_logger().info(f'LOAD     | bot -> controller {msg.data} kbit/s '
+                                   '(bot_monitor KBPS=), from the next measured run')
+        self.load.rx_kbps = max(int(msg.data), 0)
 
     def on_brake_distance(self, msg: Float32):
         """Braking distance (cm) measured by the bot (client.py) after a STOP."""
@@ -521,6 +545,13 @@ class LaserProcessor(Node):
                      f'p tx {self.p_tx * 100:4.1f}% rx {self.p_rx * 100:4.1f}% '
                      f'e2e {self.pe2e * 100:4.1f}% | scan p rx {self.p_scan * 100:4.1f}% | '
                      f'model p rx {self.p_rx_model * 100:4.1f}%')
+        if self.load.wanted or self.load.active:
+            for problem in self.load.check():
+                log.error(f'LOAD     | {problem}')
+            tx, rx = self.load.on
+            log.info(f'LOAD     | {f"ON tx {tx} rx {rx} kbit/s" if self.load.active else "off"} '
+                     f'| set tx {self.load.tx_kbps} rx {self.load.rx_kbps} kbit/s '
+                     f'-> {self.load.host or "no bot address (BOT=)"}')
         if len(self.psi_samples) < self.PSI_MIN_SAMPLES:
             log.info(f'PSI      | {len(self.psi_samples)} samples, using T = {self.psi:.0f} ms')
         else:
@@ -722,6 +753,9 @@ class AutoTest:
       run_000.csv      calibration run (CALIBRATION_RUN)
       run_001.csv ...  same columns as the manual CSV, approach + stopping only
       summary.csv      one row per run (run 0 = calibration)
+      run_NNN_load_tx.json / _rx.json   iperf3 logs of the link load (KBPS), if any
+    Link load (traffic.py): on in the wait phase before each measured run, which then
+    lasts LOAD_WARMUP_S; off when the run ends (before the return). Never in run 0.
     """
 
     SUMMARY_HEADER = [
@@ -743,6 +777,8 @@ class AutoTest:
         # downlink latency and loss source of the model (PING or SCAN, flag USEPING=) and the
         # tau_e2e the model used at the brake (tau_e2e_ms_at_brake is always the ping's)
         'tau_source', 'tau_e2e_model_ms_at_brake',
+        # link load (iperf3) running in this run, kbit/s: controller -> bot, bot -> controller
+        'load_tx_kbps', 'load_rx_kbps',
     ]
 
     def __init__(self, node: 'LaserProcessor', runs: int):
@@ -761,6 +797,8 @@ class AutoTest:
         self.target = None              # cm, start position of the next run (return phase goal)
         self.run_target = None          # cm, start position of the current run
         self.d_brake_meas = None        # cm, d_brake the bot measured for this run's brake
+        self.run_load = (0, 0)          # (tx, rx) kbit/s of the link load during this run
+        self._load_warned = False
         self._enter('align')
 
         mode = node.mode
@@ -794,6 +832,7 @@ class AutoTest:
 
     def _finish(self, why: str):
         self.node.stop_robot()
+        self.node.load.stop()
         self.node.close_csv()           # closes the run CSV and the summary
         self.finished = True
         done = sum(1 for r, _, _ in self.results if r > 0)
@@ -888,7 +927,10 @@ class AutoTest:
     def _step_wait(self):
         n = self.node
         n.stop_robot()
-        if self._elapsed() < self.node.START_SETTLE_S or not n.scan_fresh_ok() \
+        settle = n.START_SETTLE_S
+        if n.load.active:
+            settle = max(settle, n.LOAD_WARMUP_S)   # the windows fill with the loaded link
+        if self._elapsed() < settle or not n.scan_fresh_ok() \
                 or len(n.recent_dists) < n.recent_dists.maxlen or not n.link_seen:
             return
         dist = self._median_dist()
@@ -899,11 +941,14 @@ class AutoTest:
             if n.RANDOM_START:
                 self._enter('return')   # drive to the random start of the first run first
                 return
+        if self._start_load():
+            return                      # load just turned on: wait LOAD_WARMUP_S under load
         if dist <= n.safe_threshold:
             self._log().warn(f'AUTO | start {dist:.1f} cm is already below the threshold '
                              f'{n.safe_threshold:.1f} cm: the bot will brake immediately')
 
         self.run += 1
+        self.run_load = n.load.on
         self.run_start = dist
         self.run_target = self.target
         self.run_min = float('inf')
@@ -913,6 +958,24 @@ class AutoTest:
         n._last_sent_brake = None       # log the first command of the run
         self._log().info(f'AUTO | ===== {self._run_name()} start ({dist:.1f} cm) =====')
         self._enter('approach')
+
+    def _start_load(self) -> bool:
+        """Link load on before a measured run (never the calibration run 0).
+        True if it was just turned on (the wait phase starts over, LOAD_WARMUP_S long)."""
+        n = self.node
+        if n.load.active or not n.load.wanted or (self.calibration and self.run + 1 == 0):
+            return False
+        if not n.load.host:
+            if not self._load_warned:
+                self._load_warned = True
+                self._log().error('LOAD | no bot address: runs WITHOUT link load '
+                                  '(BOT=<address> or LOAD_BOT_HOST)')
+            return False
+        tx, rx = n.load.start(os.path.join(self.session_dir, f'run_{self.run + 1:03d}_load'))
+        self._log().info(f'LOAD | ON controller -> bot {tx} kbit/s, bot -> controller '
+                         f'{rx} kbit/s | {n.LOAD_WARMUP_S:g} s under load before the run')
+        self._enter('wait')
+        return True
 
     def _step_approach(self):
         n = self.node
@@ -959,9 +1022,13 @@ class AutoTest:
             f'{self.run_target:.2f}' if self.run_target is not None else '',
             f'{self.d_brake_meas:.2f}' if self.d_brake_meas is not None else '',
             n.tau_source, f'{b["tau_model"]:.2f}',
+            self.run_load[0], self.run_load[1],
         ])
         self.summary_file.flush()
         n.close_csv_run()
+        if n.load.active:
+            n.load.stop()               # run over: free link for the return to the start
+            self._log().info('LOAD | off (run over)')
         calib_failed = self._update_params(b)
         self.results.append((self.run, final, crashed))
         dbm = f'{self.d_brake_meas:.2f} cm' if self.d_brake_meas is not None else '?'
@@ -1071,10 +1138,20 @@ def parse_flags(argv):
     FIXED | SMART | SUPERSMART pick the threshold mode (NOSMART = FIXED).
     `USEPING=True|False` sets usePingTauRX: the model's downlink latency and loss from the
     ping or from the scans.
+    `KBPS=<n>` link load controller -> bot (kbit/s), `BOT=<address>` the bot's address
+    for it (see DEFAULT_KBPS / LOAD_BOT_HOST).
     Anything not given falls back to DEFAULT_MODE / ENABLE_CSV / DEFAULT_RUNS / usePingTauRX."""
     mode, log_csv, runs, use_ping = DEFAULT_MODE, ENABLE_CSV, DEFAULT_RUNS, usePingTauRX
+    kbps, bot_host = DEFAULT_KBPS, LOAD_BOT_HOST
     for arg in argv:
         flag = arg.upper()
+        k = traffic.parse_kbps(flag, arg)
+        if k is not None:
+            kbps = k
+            continue
+        if flag.startswith('BOT='):
+            bot_host = arg[4:]
+            continue
         if flag.startswith('USEPING='):
             value = flag[len('USEPING='):]
             if value in ('TRUE', '1', 'YES', 'ON'):
@@ -1103,16 +1180,20 @@ def parse_flags(argv):
         else:
             raise SystemExit(
                 f"Unknown option '{arg}'. Use: FIXED | SMART | SUPERSMART | CSV | NOCSV "
-                "| RUNS=<n> | MANUAL | USEPING=True|False")
-    return mode, log_csv, runs, use_ping
+                "| RUNS=<n> | MANUAL | USEPING=True|False | KBPS=<kbit/s> | BOT=<address>")
+    if kbps > 0 and not bot_host:
+        raise SystemExit('KBPS needs the bot address: BOT=<address> (or LOAD_BOT_HOST)')
+    return mode, log_csv, runs, use_ping, kbps, bot_host
 
 
 def main(args=None):
     # Strip --ros-args ... so only our own flags are left
-    mode, log_csv, runs, use_ping = parse_flags(remove_ros_args(args=sys.argv)[1:])
+    mode, log_csv, runs, use_ping, kbps, bot_host = parse_flags(
+        remove_ros_args(args=sys.argv)[1:])
     rclpy.init(args=args)
 
-    laser_node = LaserProcessor(mode=mode, log_csv=log_csv, runs=runs, use_ping=use_ping)
+    laser_node = LaserProcessor(mode=mode, log_csv=log_csv, runs=runs, use_ping=use_ping,
+                                kbps=kbps, bot_host=bot_host)
     # log_period=None: the controller logs the network stats in log_status()
     network_node = NetworkMonitor(on_update=laser_node.on_link_update, log_period=None)
 
@@ -1127,6 +1208,7 @@ def main(args=None):
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        laser_node.load.stop()          # never leave the link loaded
         if rclpy.ok():
             try:
                 laser_node.stop_robot()

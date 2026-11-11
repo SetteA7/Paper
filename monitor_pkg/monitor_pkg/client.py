@@ -2,6 +2,9 @@
 #   - link monitor (heartbeats, latency/loss measurement)
 #   - brake monitor: for each STOP, measures the braking distance with the LiDAR, logs it
 #     and publishes it on BRAKE_TOPIC (the controller uses it as D_BRAKE of the next run)
+#   - iperf3 servers for the link load (traffic.py). `KBPS=<n>`: n kbit/s bot -> controller
+#     during the measured AUTO runs, e.g. `ros2 run monitor_pkg bot_monitor KBPS=1024`
+import sys
 from collections import deque
 
 import numpy as np
@@ -10,11 +13,13 @@ import rclpy
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.utilities import remove_ros_args
 
 from geometry_msgs.msg import TwistStamped
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Int32
 
+from monitor_pkg import traffic
 from monitor_pkg.network_link import NetworkServer
 
 BRAKE_TOPIC = '/brake_distance'     # std_msgs/Float32, d_brake in cm, one message per STOP
@@ -137,10 +142,36 @@ class BrakeMonitor(Node):
         self.pub.publish(Float32(data=float(d_brake)))
 
 
+def parse_flags(argv: list[str]) -> int:
+    """`KBPS=<n>`: load bot -> controller in kbit/s (default 0 = none)."""
+    kbps = 0
+    for arg in argv:
+        k = traffic.parse_kbps(arg.upper(), arg)
+        if k is None:
+            raise SystemExit(f"Unknown option '{arg}'. Use: KBPS=<kbit/s>")
+        kbps = k
+    return kbps
+
+
 def main(args=None):
+    kbps = parse_flags(remove_ros_args(args=sys.argv)[1:])
     rclpy.init(args=args)
     monitor = NetworkServer()
     brake = BrakeMonitor()
+    # Link load: servers always on (the controller's clients connect when it loads the
+    # link); our KBPS goes to the controller, which runs the bot -> controller stream
+    servers = traffic.LoadServers()
+    rate_pub = brake.create_publisher(Int32, traffic.RATE_TOPIC, traffic.RATE_QOS)
+    rate_pub.publish(Int32(data=kbps))
+    brake.get_logger().info(f'LOAD | iperf3 servers on ports {traffic.PORT_TX}, '
+                            f'{traffic.PORT_RX} | bot -> controller {kbps} kbit/s '
+                            '(during the measured AUTO runs)')
+
+    def check_servers():
+        for problem in servers.check():
+            brake.get_logger().error(f'LOAD | {problem}')
+    brake.create_timer(5.0, check_servers)
+
     executor = SingleThreadedExecutor()
     executor.add_node(monitor)
     executor.add_node(brake)
@@ -149,6 +180,7 @@ def main(args=None):
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        servers.stop()
         executor.shutdown()
         brake.destroy_node()
         monitor.destroy_node()

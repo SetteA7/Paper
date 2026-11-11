@@ -161,6 +161,8 @@ ros2 run monitor_pkg controller_monitor [FLAGS]
 | `MANUAL` | open-ended mode: drive and brake until Ctrl+C, no return, no runs | off |
 | `USEPING=True` \| `USEPING=False` | downlink latency and loss used by the model: ping (network node) or scans | `True` |
 | `CSV` \| `NOCSV` | write the CSV files | `CSV` |
+| `KBPS=n` | link load controller → bot, kbit/s (AUTO runs only, see *Link load*) | `0` |
+| `BOT=<address>` | the bot's address for the link load (as this machine reaches it) | `LOAD_BOT_HOST` |
 
 Examples:
 
@@ -168,6 +170,7 @@ Examples:
 ros2 run monitor_pkg controller_monitor SUPERSMART RUNS=20
 ros2 run monitor_pkg controller_monitor SMART RUNS=10 USEPING=False
 ros2 run monitor_pkg controller_monitor MANUAL NOCSV
+ros2 run monitor_pkg controller_monitor SMART RUNS=10 KBPS=10 BOT=192.168.1.20
 ```
 
 The network monitor nodes accept ROS parameters, which must be the same on both ends:
@@ -189,6 +192,21 @@ Each run goes through five phases:
    `min_dist < S`.
 4. **stopping**: send 0 for 2 s, then wait (up to 4 s) for the bot's d_brake.
 5. **return**: reverse to the start position of the next run.
+
+**Link load** (`traffic.py`, iperf3 UDP at a fixed rate):
+- `controller_monitor ... KBPS=10 BOT=<bot address>` loads controller → bot with 10 kbit/s;
+  `bot_monitor KBPS=1024` loads bot → controller with 1024 kbit/s. Either or both.
+- `bot_monitor` always runs two iperf3 servers (ports 5211, 5212) and tells the controller
+  its rate. The controller runs both clients (`-R` for bot → controller), so turning the
+  load on and off happens on the controller: no stop message has to cross the loaded link.
+- The load goes on in the wait phase before each measured run, which then lasts
+  `LOAD_WARMUP_S` (10 s, so the 10 s loss/latency windows see the loaded link), and off
+  when the run ends, before the bot drives back. Never in the calibration run 0.
+- Fail-safes: each client stops by itself after 120 s, and dies with the controller.
+- The bot must accept TCP + UDP 5211-5212 from the controller (like the zenoh port).
+  Install iperf3 on both machines (`sudo apt install iperf3`).
+- iperf3 logs per run: `run_NNN_load_tx.json` / `_rx.json` (per-second rate, jitter, lost
+  packets in `intervals`).
 
 **Calibration run 0** (`CALIBRATION_RUN = True`):
 - Run 0 always brakes in **FIXED** mode (S = `SAFE_THRESHOLD`), whatever the session mode,
@@ -258,6 +276,7 @@ Files go to `~/ros2_ws_A7/csv/`:
 | `min_dist_cm`, `margin_to_crash_cm`, `crashed` | closest reading; min − L; 1 if ≤ 0 |
 | `N_at_brake`, `budget_ms_at_brake`, `p_crash_at_brake` | model values at the brake |
 | `tau_e2e_ms_at_brake`, `p_e2e_at_brake` | network node (ping) values at the brake |
+| `load_tx_kbps`, `load_rx_kbps` | link load during the run: controller → bot, bot → controller (0 = none) |
 | `tau_source`, `tau_e2e_model_ms_at_brake` | `PING` or `SCAN` (source of the model's downlink τ and p), and the τ_e2e the model used |
 | `psi_ms_at_brake`, `psi_stop_ms` | ψ used by the model; measured wait of the STOP itself |
 | `VMAX_cm_s`, `D_BRAKE_cm`, `T_ms`, `L_cm`, `M_cm`, `V_CMD_cm_s` | parameters used in this run |
