@@ -21,7 +21,7 @@ from std_msgs.msg import Float32
 
 from monitor_pkg import crash_model
 from monitor_pkg.client import BRAKE_QOS, BRAKE_TOPIC
-from monitor_pkg.network_link import LinkStats, NetworkMonitor, SeqLoss
+from monitor_pkg.network_link import LinkStats, NetworkMonitor, ScanLoss
 
 
 # ============================================================== TOGGLES
@@ -50,8 +50,9 @@ ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
 #   False: scans: latency = (arrival time - header.stamp) - scan_time, median of the last
 #          SCAN_TAU_WINDOW scans. header.stamp is the start of the scan, so scan_time
 #          (one rotation, msg.scan_time) is the acquisition, not latency, and is removed.
-#          loss = p_scan: missing DDS publication sequence numbers of /scan over the last
-#          SCAN_LOSS_WINDOW scans (a whole scan, lost if any of its UDP fragments is lost)
+#          loss = p_scan: scans missing from the header.stamp sequence (gaps of more than
+#          one scan period) over the last SCAN_LOSS_WINDOW scans, see ScanLoss. A whole
+#          scan, lost if any of its fragments is lost on the way (zenoh bridge + Starlink)
 # Logged either way: CSV tau_tx_ms / tau_rx_ms / tau_e2e_ms and p_tx / p_rx / p_e2e = the
 # network node's (ping) values, tau_rx_scan_ms and p_scan = the scan values,
 # tau_e2e_model_ms = the latency the model used.
@@ -182,10 +183,9 @@ class LaserProcessor(Node):
         self.p_tx = 0.05
         self.p_rx = 0.05
         self.pe2e = self.p_rx + self.p_tx - (self.p_tx * self.p_rx)
-        # downlink loss of whole scans (DDS sequence numbers), always; NaN until known
-        self.scan_loss = SeqLoss(self.SCAN_LOSS_WINDOW, self.SCAN_TIMEOUT_NS * 1e-9)
+        # downlink loss of whole scans (gaps in header.stamp), always; NaN until known
+        self.scan_loss = ScanLoss(self.SCAN_LOSS_WINDOW, self.SCAN_TIMEOUT_NS * 1e-9)
         self.p_scan = float('nan')
-        self._scan_seq_missing = False  # RMW gives no sequence numbers: p_scan stays NaN
 
         # --- ROS I/O ---
         self._msg = TwistStamped()
@@ -370,23 +370,17 @@ class LaserProcessor(Node):
         if len(self.psi_samples) >= self.PSI_MIN_SAMPLES:
             self.psi = float(np.quantile(self.psi_samples, self.PSI_QUANTILE))
 
-    def scan_callback(self, msg: LaserScan, info: dict):
+    def scan_callback(self, msg: LaserScan):
         self._scan_arrival_mono = time.monotonic_ns()   # for psi (newest scan wins)
-        # Downlink loss of whole scans from the DDS publication sequence number (one per
-        # scan, however many UDP fragments it needs), always logged; the model uses it
-        # only with use_ping False (see p_rx_model)
-        seq = info.get('publication_sequence_number')
-        if seq is not None:
-            self.scan_loss.on_message(seq, self._scan_arrival_mono * 1e-9)
-            self.p_scan = self.scan_loss.loss
-        elif not self._scan_seq_missing:
-            self._scan_seq_missing = True
-            self.get_logger().warn('NET      | this RMW gives no publication sequence numbers: '
-                                   'p_scan = NaN, the model keeps the ping loss p_rx')
         arrival_ns = self.get_clock().now().nanoseconds
         self.last_scan_ns = arrival_ns
         lidar_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
         self.last_lidar_ns = lidar_ns
+        # Downlink loss of whole scans from gaps in header.stamp (end to end, see ScanLoss),
+        # always logged; the model uses it only with use_ping False (see p_rx_model)
+        self.scan_loss.on_message(lidar_ns * 1e-9, msg.scan_time or self.T / 1000.0,
+                                  self._scan_arrival_mono * 1e-9)
+        self.p_scan = self.scan_loss.loss
         # Downlink latency measured on the real sensor data (needs synced clocks), always
         # logged; the model uses it only with use_ping False (see tau_e2e_model):
         # tau_rx_scan = (now - msg.header.stamp) - scan_time

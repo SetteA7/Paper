@@ -99,44 +99,58 @@ class Direction:
         return statistics.median(self.latencies) if self.latencies else 0.0
 
 
-class SeqLoss:
-    """Loss of a topic over its last `window` messages, from the DDS publication sequence
-    number of each message (rclpy message info: 1, 2, 3, ... per publisher). There is one
-    number per message however many UDP/IP fragments it needs, so a big message (a scan)
-    counts as lost if any of its fragments was lost.
+class ScanLoss:
+    """Loss of a periodic sensor topic (the LiDAR scans) over its last `window` messages,
+    from gaps in header.stamp. The stamp travels inside the message, so the count is end
+    to end. DDS sequence numbers are not: with zenoh-bridge-ros2dds the controller's
+    subscriber gets the scans from the bridge's own DDS writer, which numbers only the
+    scans that made it across, so its numbers never have gaps.
 
-    A jump in the numbers = lost messages. While nothing arrives for `timeout` s, every
-    on_tick counts one lost message provisionally, so the loss rises during an outage as
-    for the heartbeats; when messages come back the provisional losses are replaced by the
-    real gap. A number lower than expected = the publisher restarted: no gap is counted.
+    A gap of k periods = k - 1 lost scans. The period is the median spacing of consecutive
+    scans (spacing < 1.5 periods), `first_period` until there are some. Scans the driver
+    never published would count as lost too (on the bot it publishes every period).
+
+    While nothing arrives for `timeout` s, every on_tick counts one lost scan
+    provisionally, so the loss rises during an outage as for the heartbeats; when scans
+    come back the real gap replaces the provisional losses. A stamp that goes backwards
+    (driver restart) counts no gap.
     """
 
-    def __init__(self, window: int, timeout: float):
+    def __init__(self, window: int, timeout: float, period_window: int = 50):
         self.timeout = timeout
-        self.received = deque(maxlen=window)  # 1 = received, 0 = lost
-        self.expected = None                   # next sequence number
+        self.received = deque(maxlen=window)        # 1 = received, 0 = lost
+        self.periods = deque(maxlen=period_window)  # s, spacing of consecutive scans
+        self.last_stamp = None
         self.last_rx = None
-        self.silent = 0                        # provisional losses counted by on_tick
+        self.silent = 0                             # provisional losses counted by on_tick
 
-    def on_message(self, seq: int, now: float):
+    def on_message(self, stamp: float, first_period: float, now: float):
+        """stamp = header.stamp (s), first_period = period guess (s) until it is measured,
+        now = arrival time (s, same clock as on_tick)."""
         for _ in range(min(self.silent, len(self.received))):
-            self.received.pop()                # replaced by the real gap below
+            self.received.pop()                     # replaced by the real gap below
         self.silent = 0
-        if self.expected is not None and seq >= self.expected:
-            self.received.extend([0] * min(seq - self.expected, self.received.maxlen))
+        if self.last_stamp is not None:
+            gap = stamp - self.last_stamp
+            period = statistics.median(self.periods) if self.periods else first_period
+            if 0 < gap < 1.5 * period:
+                self.periods.append(gap)
+            elif gap > 0 and period > 0:
+                lost = max(round(gap / period) - 1, 0)
+                self.received.extend([0] * min(lost, self.received.maxlen))
         self.received.append(1)
-        self.expected = seq + 1
+        self.last_stamp = stamp
         self.last_rx = now
 
     def on_tick(self, now: float):
-        """Call once per message period. Nothing is counted before the first message."""
+        """Call once per scan period. Nothing is counted before the first scan."""
         if self.last_rx is not None and now - self.last_rx > self.timeout:
             self.received.append(0)
             self.silent += 1
 
     @property
     def loss(self) -> float:
-        """NaN until the first message."""
+        """NaN until the first scan."""
         n = len(self.received)
         return 1.0 - sum(self.received) / n if n else float('nan')
 

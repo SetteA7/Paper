@@ -245,7 +245,7 @@ Files go to `~/ros2_ws_A7/csv/`:
 | `tau_rx_scan_ms` | downlink latency from the scans: median of (arrival − stamp − scan_time), last 100 |
 | `tau_e2e_model_ms` | τ_e2e used by the model: ping, or ping uplink + `tau_rx_scan_ms` with `USEPING=False` |
 | `psi_sample_ms` | measured wait of the command based on this scan (empty if a newer scan came first) |
-| `p_scan` | downlink loss of whole scans: missing DDS publication sequence numbers of `/scan`, last 100 scans (`nan` if the RMW gives none). The model's p_rx with `USEPING=False` |
+| `p_scan` | downlink loss of whole scans: gaps in `header.stamp` longer than one scan period, last 100 scans (`nan` before the first scan). The model's p_rx with `USEPING=False` |
 
 ### `summary.csv` (one row per run)
 
