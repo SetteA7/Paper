@@ -353,6 +353,7 @@ class LaserProcessor(Node):
         # Downlink latency measured on the real sensor data (needs synced clocks), always
         # logged; the model uses it only with use_ping False (see tau_e2e_model):
         # tau_rx_scan = (now - msg.header.stamp) - scan_time
+        # NOTE: HERE !!! HERE IS THE SCAN TIME DOUBT
         self.scan_delays.append((arrival_ns - lidar_ns) * 1e-6 - msg.scan_time * 1000.0)
         self.tau_rx_scan = float(np.median(self.scan_delays))
 
