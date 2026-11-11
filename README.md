@@ -93,7 +93,7 @@ $$t_{e2e,thresh} = \varphi + \tau_{tx} + \psi + \tau_{rx} + (X+Y)\,T > \Delta t$
 | φ | wait from the threshold crossing to the next LiDAR sample, U(0, T) | random start position (AutoTest) |
 | τ_tx, τ_rx | one-way latencies (paper naming) | network node (ping), or the scans (`USEPING=False`) |
 | ψ | wait at the controller, from scan arrival to the tick that sends the command | measured on every tick (`_measure_psi`) |
-| X, Y | failed scan / STOP transmissions, geometric | loss from the heartbeats |
+| X, Y | failed scan / STOP transmissions, geometric | loss from the heartbeats; scan loss X from the whole scans (`p_scan`) with `USEPING=False` |
 | T | LiDAR period = control period, 100 ms | constant |
 
 With $\Delta t = 1000\,(S - L - M - d_{brake})/v_{max}$ and the budget $B = \Delta t - \tau_{e2e} - \psi$:
@@ -159,7 +159,7 @@ ros2 run monitor_pkg controller_monitor [FLAGS]
 | `FIXED` \| `SMART` \| `SUPERSMART` | threshold mode (`NOSMART` = `FIXED`) | `FIXED` |
 | `RUNS=n` | automated test: calibration run 0 + n runs | `RUNS=1` |
 | `MANUAL` | open-ended mode: drive and brake until Ctrl+C, no return, no runs | off |
-| `USEPING=True` \| `USEPING=False` | downlink latency used by the model: ping (network node) or scans | `True` |
+| `USEPING=True` \| `USEPING=False` | downlink latency and loss used by the model: ping (network node) or scans | `True` |
 | `CSV` \| `NOCSV` | write the CSV files | `CSV` |
 
 Examples:
@@ -243,6 +243,7 @@ Files go to `~/ros2_ws_A7/csv/`:
 | `tau_rx_scan_ms` | downlink latency from the scans: median of (arrival − stamp − scan_time), last 100 |
 | `tau_e2e_model_ms` | τ_e2e used by the model: ping, or ping uplink + `tau_rx_scan_ms` with `USEPING=False` |
 | `psi_sample_ms` | measured wait of the command based on this scan (empty if a newer scan came first) |
+| `p_scan` | downlink loss of whole scans: missing DDS publication sequence numbers of `/scan`, last 100 scans (`nan` if the RMW gives none). The model's p_rx with `USEPING=False` |
 
 ### `summary.csv` (one row per run)
 
@@ -255,7 +256,7 @@ Files go to `~/ros2_ws_A7/csv/`:
 | `min_dist_cm`, `margin_to_crash_cm`, `crashed` | closest reading; min − L; 1 if ≤ 0 |
 | `N_at_brake`, `budget_ms_at_brake`, `p_crash_at_brake` | model values at the brake |
 | `tau_e2e_ms_at_brake`, `p_e2e_at_brake` | network node (ping) values at the brake |
-| `tau_source`, `tau_e2e_model_ms_at_brake` | `PING` or `SCAN`, and the τ_e2e the model used |
+| `tau_source`, `tau_e2e_model_ms_at_brake` | `PING` or `SCAN` (source of the model's downlink τ and p), and the τ_e2e the model used |
 | `psi_ms_at_brake`, `psi_stop_ms` | ψ used by the model; measured wait of the STOP itself |
 | `VMAX_cm_s`, `D_BRAKE_cm`, `T_ms`, `L_cm`, `M_cm`, `V_CMD_cm_s` | parameters used in this run |
 | `v_cruise_cm_s`, `cruise_scans` | cruise speed measured in this run, and how many scans it is based on |

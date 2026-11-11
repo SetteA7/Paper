@@ -99,6 +99,48 @@ class Direction:
         return statistics.median(self.latencies) if self.latencies else 0.0
 
 
+class SeqLoss:
+    """Loss of a topic over its last `window` messages, from the DDS publication sequence
+    number of each message (rclpy message info: 1, 2, 3, ... per publisher). There is one
+    number per message however many UDP/IP fragments it needs, so a big message (a scan)
+    counts as lost if any of its fragments was lost.
+
+    A jump in the numbers = lost messages. While nothing arrives for `timeout` s, every
+    on_tick counts one lost message provisionally, so the loss rises during an outage as
+    for the heartbeats; when messages come back the provisional losses are replaced by the
+    real gap. A number lower than expected = the publisher restarted: no gap is counted.
+    """
+
+    def __init__(self, window: int, timeout: float):
+        self.timeout = timeout
+        self.received = deque(maxlen=window)  # 1 = received, 0 = lost
+        self.expected = None                   # next sequence number
+        self.last_rx = None
+        self.silent = 0                        # provisional losses counted by on_tick
+
+    def on_message(self, seq: int, now: float):
+        for _ in range(min(self.silent, len(self.received))):
+            self.received.pop()                # replaced by the real gap below
+        self.silent = 0
+        if self.expected is not None and seq >= self.expected:
+            self.received.extend([0] * min(seq - self.expected, self.received.maxlen))
+        self.received.append(1)
+        self.expected = seq + 1
+        self.last_rx = now
+
+    def on_tick(self, now: float):
+        """Call once per message period. Nothing is counted before the first message."""
+        if self.last_rx is not None and now - self.last_rx > self.timeout:
+            self.received.append(0)
+            self.silent += 1
+
+    @property
+    def loss(self) -> float:
+        """NaN until the first message."""
+        n = len(self.received)
+        return 1.0 - sum(self.received) / n if n else float('nan')
+
+
 class Peer(Node):
     """Publishes heartbeats on `tx_topic`, measures the heartbeats on `rx_topic`."""
 

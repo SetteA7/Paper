@@ -21,7 +21,7 @@ from std_msgs.msg import Float32
 
 from monitor_pkg import crash_model
 from monitor_pkg.client import BRAKE_QOS, BRAKE_TOPIC
-from monitor_pkg.network_link import LinkStats, NetworkMonitor
+from monitor_pkg.network_link import LinkStats, NetworkMonitor, SeqLoss
 
 
 # ============================================================== TOGGLES
@@ -43,15 +43,19 @@ DEFAULT_RUNS = 1        # runs when RUNS= is not given (each run returns to the 
 DEFAULT_MODE = 'FIXED'
 MODES = ('FIXED', 'SMART', 'SUPERSMART')
 ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
-# Downlink latency (bot -> controller) used by the MODEL (S, B, P_crash).
+# Downlink latency and loss (bot -> controller) used by the MODEL (N, S, B, P_crash).
 # Override at launch: USEPING=False / USEPING=True
-#   True:  ping: the network node's heartbeat one-way latency, median of the last 100
-#   False: scans: (arrival time - header.stamp) - scan_time, median of the last
+#   True:  ping: the network node's heartbeat one-way latency (median of the last 100)
+#          and loss p_rx
+#   False: scans: latency = (arrival time - header.stamp) - scan_time, median of the last
 #          SCAN_TAU_WINDOW scans. header.stamp is the start of the scan, so scan_time
-#          (one rotation, msg.scan_time) is the acquisition, not latency, and is removed
-# Logged either way: CSV tau_tx_ms / tau_rx_ms / tau_e2e_ms = the network node's (ping)
-# values, tau_rx_scan_ms = the scan value, tau_e2e_model_ms = what the model used.
-# Loss p_tx, p_rx and the uplink tau_tx always come from the ping.
+#          (one rotation, msg.scan_time) is the acquisition, not latency, and is removed.
+#          loss = p_scan: missing DDS publication sequence numbers of /scan over the last
+#          SCAN_LOSS_WINDOW scans (a whole scan, lost if any of its UDP fragments is lost)
+# Logged either way: CSV tau_tx_ms / tau_rx_ms / tau_e2e_ms and p_tx / p_rx / p_e2e = the
+# network node's (ping) values, tau_rx_scan_ms and p_scan = the scan values,
+# tau_e2e_model_ms = the latency the model used.
+# The uplink loss p_tx and latency tau_tx always come from the ping.
 usePingTauRX = True
 CSV_DIR = os.path.expanduser("~/ros2_ws_A7/csv")   # ~ = home of whoever runs it
 
@@ -80,6 +84,7 @@ class LaserProcessor(Node):
     SCAN_TIMEOUT_NS = 500_000_000   # 0.5 s without scans -> brake (lidar dead / driver crashed)
     STATUS_PERIOD = 1.0             # s, period of the LIDAR + NET status log
     SCAN_TAU_WINDOW = 100           # scans in the median of tau_rx_scan (see usePingTauRX)
+    SCAN_LOSS_WINDOW = 100          # scans in p_scan (10 s, as the heartbeats' window)
 
     # --- psi: wait from scan arrival to the control tick that sends the command ---
     PSI_WINDOW = 50                 # psi samples kept, one per control tick (5 s)
@@ -176,6 +181,10 @@ class LaserProcessor(Node):
         self.p_tx = 0.05
         self.p_rx = 0.05
         self.pe2e = self.p_rx + self.p_tx - (self.p_tx * self.p_rx)
+        # downlink loss of whole scans (DDS sequence numbers), always; NaN until known
+        self.scan_loss = SeqLoss(self.SCAN_LOSS_WINDOW, self.SCAN_TIMEOUT_NS * 1e-9)
+        self.p_scan = float('nan')
+        self._scan_seq_missing = False  # RMW gives no sequence numbers: p_scan stays NaN
 
         # --- ROS I/O ---
         self._msg = TwistStamped()
@@ -197,7 +206,7 @@ class LaserProcessor(Node):
             self._open_csv()
 
         self.get_logger().info(
-            f'START | mode {self.mode} | model tau_rx from {self.tau_source} | '
+            f'START | mode {self.mode} | model downlink tau/p from {self.tau_source} | '
             f'CSV {self.csv_file.name if self.csv_file else "OFF"} | '
             f'speed {self.LINEAR_SPEED} m/s'
             + (f' | AUTO {"calibration run 0 + " if self.CALIBRATION_RUN else ""}{runs} runs '
@@ -209,7 +218,7 @@ class LaserProcessor(Node):
 
     @property
     def tau_source(self) -> str:
-        """Where the model's downlink latency comes from: 'PING' or 'SCAN'."""
+        """Where the model's downlink latency and loss come from: 'PING' or 'SCAN'."""
         return 'PING' if self.use_ping else 'SCAN'
 
     @property
@@ -221,6 +230,15 @@ class LaserProcessor(Node):
         if self.use_ping or np.isnan(self.tau_rx_scan):
             return self.taue2e
         return self.tau_tx + self.tau_rx_scan
+
+    @property
+    def p_rx_model(self) -> float:
+        """Downlink loss used by the model (N, B_min, P_crash): the ping's p_rx, or with
+        use_ping False the scans' p_scan (ping until p_scan is known). p_tx, p_rx, pe2e
+        themselves always keep the network node's values."""
+        if self.use_ping or np.isnan(self.p_scan):
+            return self.p_rx
+        return self.p_scan
 
     # ------------------------------------------------------------------ CSV
     def _open_csv(self, path: str | None = None):
@@ -235,11 +253,12 @@ class LaserProcessor(Node):
             'min_distance_cm', 'safe_threshold_cm', 'brake_state',
             'tau_tx_ms', 'tau_rx_ms', 'tau_e2e_ms', 'p_tx', 'p_rx', 'p_e2e',
             'budget_ms', 'p_crash', 'vmax_cm_s', 'psi_ms', 'tau_rx_scan_ms', 'tau_e2e_model_ms',
-            'psi_sample_ms'
+            'psi_sample_ms', 'p_scan'
         ])
 
     def _csv_row(self, lidar_ns: int, arrival_ns: int, scan_time_ms: float) -> list:
-        """Row of one scan, all columns but psi_sample_ms (known only at the next tick).
+        """Row of one scan; psi_sample_ms is known only at the next tick, so it is a None
+        placeholder filled by _flush_csv_row.
         lidar = msg.header.stamp (set by the driver on the bot when the scan was taken),
         arrival = controller clock when the scan reached scan_callback.
         delay = arrival - lidar; only meaningful if both clocks are synced (chrony).
@@ -252,7 +271,9 @@ class LaserProcessor(Node):
             f"{self.tau_tx:.2f}", f"{self.tau_rx:.2f}", f"{self.taue2e:.2f}",
             f"{self.p_tx:.4f}", f"{self.p_rx:.4f}", f"{self.pe2e:.4f}",
             f"{self.budget_ms:.2f}", f"{self.p_crash:.6f}", f"{self.VMAX:.2f}", f"{self.psi:.2f}",
-            f"{self.tau_rx_scan:.2f}", f"{self.tau_e2e_model:.2f}"
+            f"{self.tau_rx_scan:.2f}", f"{self.tau_e2e_model:.2f}",
+            None,                       # psi_sample_ms (_flush_csv_row)
+            f"{self.p_scan:.4f}"
         ]
 
     def _flush_csv_row(self, psi_sample: float | None = None):
@@ -261,7 +282,8 @@ class LaserProcessor(Node):
         (a newer scan arrived first, or the CSV is being closed)."""
         row, self._pending_row = self._pending_row, None
         if row is not None and self.csv_writer is not None:
-            self.csv_writer.writerow(row + [f"{psi_sample:.2f}" if psi_sample is not None else ''])
+            row[row.index(None)] = f"{psi_sample:.2f}" if psi_sample is not None else ''
+            self.csv_writer.writerow(row)
 
     def close_csv_run(self):
         """Close the current CSV only (AUTO mode: end of a run)."""
@@ -296,7 +318,7 @@ class LaserProcessor(Node):
         self.tau_tx = s.tau_tx
         self.tau_rx = s.tau_rx
         self.taue2e = self.tau_tx + self.tau_rx
-        self.update(s.p_tx, s.p_rx)
+        self.update(self.p_tx, self.p_rx_model)
 
     def on_brake_distance(self, msg: Float32):
         """Braking distance (cm) measured by the bot (client.py) after a STOP."""
@@ -315,7 +337,7 @@ class LaserProcessor(Node):
     def _supersmart_threshold(self) -> float:
         """S_smart = vmax/1000 * (B_min + tau_e2e + psi) + L + m + d_brake (thesis 5.7)."""
         B, self.target_reached = crash_model.b_min(
-            self.T, self.p_tx, self.p_rx, self.P_TARGET, self.N_MAX)
+            self.T, self.p_tx, self.p_rx_model, self.P_TARGET, self.N_MAX)
         return crash_model.threshold_from_budget(
             B, self.tau_e2e_model, self.psi, self.VMAX, self.BOT_LENGTH + self.M + self.D_BRAKE)
 
@@ -328,7 +350,7 @@ class LaserProcessor(Node):
         self.budget_ms = crash_model.budget_from_threshold(
             self.safe_threshold, self.tau_e2e_model, self.psi, self.VMAX,
             self.BOT_LENGTH + self.M + self.D_BRAKE)
-        self.p_crash = crash_model.p_crash(self.budget_ms, self.T, self.p_tx, self.p_rx)
+        self.p_crash = crash_model.p_crash(self.budget_ms, self.T, self.p_tx, self.p_rx_model)
 
     def _measure_psi(self):
         """Called at the start of every control tick: if a scan arrived since the last
@@ -344,8 +366,19 @@ class LaserProcessor(Node):
         if len(self.psi_samples) >= self.PSI_MIN_SAMPLES:
             self.psi = float(np.quantile(self.psi_samples, self.PSI_QUANTILE))
 
-    def scan_callback(self, msg: LaserScan):
+    def scan_callback(self, msg: LaserScan, info: dict):
         self._scan_arrival_mono = time.monotonic_ns()   # for psi (newest scan wins)
+        # Downlink loss of whole scans from the DDS publication sequence number (one per
+        # scan, however many UDP fragments it needs), always logged; the model uses it
+        # only with use_ping False (see p_rx_model)
+        seq = info.get('publication_sequence_number')
+        if seq is not None:
+            self.scan_loss.on_message(seq, self._scan_arrival_mono * 1e-9)
+            self.p_scan = self.scan_loss.loss
+        elif not self._scan_seq_missing:
+            self._scan_seq_missing = True
+            self.get_logger().warn('NET      | this RMW gives no publication sequence numbers: '
+                                   'p_scan = NaN, the model keeps the ping loss p_rx')
         arrival_ns = self.get_clock().now().nanoseconds
         self.last_scan_ns = arrival_ns
         lidar_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
@@ -488,7 +521,8 @@ class LaserProcessor(Node):
                      f'e2e {self.taue2e:5.1f} ms | scan rx {self.tau_rx_scan:5.1f} ms | '
                      f'model e2e {self.tau_e2e_model:5.1f} ms ({self.tau_source}) | '
                      f'p tx {self.p_tx * 100:4.1f}% rx {self.p_rx * 100:4.1f}% '
-                     f'e2e {self.pe2e * 100:4.1f}%')
+                     f'e2e {self.pe2e * 100:4.1f}% | scan p rx {self.p_scan * 100:4.1f}% | '
+                     f'model p rx {self.p_rx_model * 100:4.1f}%')
         if len(self.psi_samples) < self.PSI_MIN_SAMPLES:
             log.info(f'PSI      | {len(self.psi_samples)} samples, using T = {self.psi:.0f} ms')
         else:
@@ -533,6 +567,8 @@ class LaserProcessor(Node):
     def publish_cmd(self):
         """Control step, every T ms."""
         self._measure_psi()
+        self.scan_loss.on_tick(time.monotonic())    # counts scans lost while /scan is silent
+        self.p_scan = self.scan_loss.loss
         if self.auto is not None:
             self.auto.step()
         else:
@@ -705,7 +741,7 @@ class AutoTest:
         'start_target_cm',
         # braking distance measured by the bot in this run (D_BRAKE of runs 1..n if run 0)
         'd_brake_meas_cm',
-        # downlink latency source of the model (PING or SCAN, flag USEPING=) and the
+        # downlink latency and loss source of the model (PING or SCAN, flag USEPING=) and the
         # tau_e2e the model used at the brake (tau_e2e_ms_at_brake is always the ping's)
         'tau_source', 'tau_e2e_model_ms_at_brake',
     ]
@@ -1028,8 +1064,8 @@ def parse_flags(argv):
     calibration run 0 if CALIBRATION_RUN.
     `MANUAL` = old open-ended mode: no runs, no return, until Ctrl+C.
     FIXED | SMART | SUPERSMART pick the threshold mode (NOSMART = FIXED).
-    `USEPING=True|False` sets usePingTauRX: the model's downlink latency from the ping
-    or from the scans.
+    `USEPING=True|False` sets usePingTauRX: the model's downlink latency and loss from the
+    ping or from the scans.
     Anything not given falls back to DEFAULT_MODE / ENABLE_CSV / DEFAULT_RUNS / usePingTauRX."""
     mode, log_csv, runs, use_ping = DEFAULT_MODE, ENABLE_CSV, DEFAULT_RUNS, usePingTauRX
     for arg in argv:
