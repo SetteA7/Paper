@@ -31,11 +31,19 @@ class BrakeMonitor(Node):
     d(STOP)      the last scans before it are up to ~100 ms old, so a line is fitted to the
                  readings of the last FIT_S before the STOP (bot at cruise speed) and
                  evaluated at the STOP time. Each reading is timed at its own sample:
-                 header.stamp + index * time_increment
+                 header.stamp + (order of the ray in time) * time_increment, see RAYS_REVERSED
     standstill   STILL_SCANS consecutive readings within STILL_SPAN_CM; d = their median
     """
 
     K = 10                          # samples at each end of the array (front, as controller.py)
+    # sllidar_ros2 with angle_compensate and inverted: false stores the i-th measured ray in
+    # ranges[n-1-i] (sllidar_node.cpp, publish_scan, reverse_data) but still reports
+    # header.stamp = first measured ray and time_increment > 0. So ranges[k] was measured at
+    # stamp + (n-1-k) * time_increment: index 0 is the NEWEST ray, not the oldest.
+    # Timing it as stamp + k * time_increment put the front rays ~scan_time too early and
+    # made d_brake ~v * scan_time (~4.3 cm) too small. False: driver follows the LaserScan
+    # convention (ranges[k] at stamp + k * time_increment).
+    RAYS_REVERSED = True
     FIT_S = 0.35                    # s of readings before the STOP used for d(STOP)
     STILL_SCANS = 5                 # consecutive readings ...
     STILL_SPAN_CM = 0.5             # ... within this span: standstill
@@ -73,8 +81,10 @@ class BrakeMonitor(Node):
         if not ok.any():
             return
         j = int(np.argmin(np.where(ok, zone, np.inf)))
+        k = int(idx[j])
+        order = n - 1 - k if self.RAYS_REVERSED else k     # position of the ray in time
         t = (msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-             + int(idx[j]) * msg.time_increment)
+             + order * msg.time_increment)
         self.readings.append((t, float(zone[j]) * 100.0))
         if self.stop_t is not None:
             self._check_standstill()
