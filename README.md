@@ -1,11 +1,14 @@
-# Network-aware braking experiment (ROS 2)
+# Remote Braking over Starlink: Crash-Probability Experiments
 
-A robot drives toward a wall while it streams LiDAR scans over Wi-Fi to a remote
-controller. The controller decides GO or STOP and sends the command back. Packet loss and
-latency on the link delay the STOP, so the robot may end up too close to the wall.
+Experiment code for the paper.
 
-This repository contains the code used to measure that effect and to test a model of
-the crash probability (thesis, chapter 5):
+A ground robot drives toward a wall while it streams LiDAR scans over a **Starlink
+satellite link** to a remote controller. The controller decides GO or STOP and sends the
+command back over the same link. Packet loss and latency on the link delay the STOP, so
+the robot may end up too close to the wall.
+
+This repository contains the code used to measure that effect and to test the paper's
+model of the crash probability:
 
 - the **controller** computes a braking threshold S from live network statistics and
   logs every quantity of the model;
@@ -24,7 +27,7 @@ Python 3.12.
 | Path | What it is |
 |---|---|
 | `monitor_pkg/monitor_pkg/controller.py` | Controller node (`controller_monitor`): threshold, GO/STOP, ψ, CSV logging, `AutoTest` |
-| `monitor_pkg/monitor_pkg/crash_model.py` | The crash model (thesis §5.6–5.7), pure math, no ROS |
+| `monitor_pkg/monitor_pkg/crash_model.py` | The paper's crash model (crash probability, S.M.A.R.T. threshold), pure math, no ROS |
 | `monitor_pkg/monitor_pkg/client.py` | Bot node (`bot_monitor`): network server + `BrakeMonitor` (d_brake per stop) |
 | `monitor_pkg/monitor_pkg/network_link.py` | Heartbeat link monitor used on both ends (loss, one-way latency) |
 | `link_monitor_msg/` | Message package: `LinkState` (heartbeat). `LinkMetrics` is defined but unused |
@@ -37,6 +40,9 @@ timer on the bot, and `noise` holds an uplink noise generator.
 ## How it works
 
 ### Nodes and topics
+
+The bot and the controller are two machines connected through the Starlink link. All
+five topics below cross it.
 
 | Topic | Type | From → to | QoS | Content |
 |---|---|---|---|---|
@@ -51,9 +57,9 @@ timer on the bot, and `noise` holds an uplink noise generator.
 > DDS retransmits on its own instead, and loss turns into latency. A best-effort publisher
 > cannot connect to a reliable subscriber. Keep this in mind when you change any topic.
 
-### Naming: thesis vs code
+### Naming: paper vs code
 
-| | Thesis | Code (`tx` / `rx`) |
+| | Paper | Code (`tx` / `rx`) |
 |---|---|---|
 | bot → controller (scans) | TX: `p_tx`, `τ_tx` | downlink: `p_rx`, `tau_rx` |
 | controller → bot (STOP) | RX: `p_rx`, `τ_rx` | uplink: `p_tx`, `tau_tx` |
@@ -85,7 +91,7 @@ $$t_{e2e,thresh} = \varphi + \tau_{tx} + \psi + \tau_{rx} + (X+Y)\,T > \Delta t$
 | Symbol | Meaning | Where it comes from |
 |---|---|---|
 | φ | wait from the threshold crossing to the next LiDAR sample, U(0, T) | random start position (AutoTest) |
-| τ_tx, τ_rx | one-way latencies (thesis naming) | network node (ping), or the scans (`USEPING=False`) |
+| τ_tx, τ_rx | one-way latencies (paper naming) | network node (ping), or the scans (`USEPING=False`) |
 | ψ | wait at the controller, from scan arrival to the tick that sends the command | measured on every tick (`_measure_psi`) |
 | X, Y | failed scan / STOP transmissions, geometric | loss from the heartbeats |
 | T | LiDAR period = control period, 100 ms | constant |
@@ -128,6 +134,9 @@ driver on the bot.
 - **Clocks.** One-way latencies, `scan_delay_ms` and `tau_rx_scan_ms` compare the two
   machines' clocks, so sync them with **chrony** (`chronyc tracking` should show a small
   offset). τ_e2e is offset-free; ψ, d_brake and VMAX each use one clock and need no sync.
+  NTP-style sync assumes equal delays both ways. If the satellite link's uplink and
+  downlink delays differ, the clock offset is wrong by half the difference. That shifts
+  latency from one direction to the other, but τ_e2e is unaffected.
 
 ---
 
