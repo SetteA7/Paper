@@ -83,14 +83,27 @@ class BrakeMonitor(Node):
         j = int(np.argmin(np.where(ok, zone, np.inf)))
         k = int(idx[j])
         order = n - 1 - k if self.RAYS_REVERSED else k     # position of the ray in time
-        t = (msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-             + order * msg.time_increment)
-        self.readings.append((t, float(zone[j]) * 100.0))
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        t = stamp + order * msg.time_increment
+        t_other = stamp + (n - 1 - order) * msg.time_increment   # the other rule, for the log
+        self.readings.append((t, float(zone[j]) * 100.0, k, n, t_other))
         if self.stop_t is not None:
             self._check_standstill()
 
+    def _fit_at_stop(self, readings: list) -> tuple[float, str] | None:
+        """d(STOP): line through the (time, distance) readings, evaluated at stop_t."""
+        if len(readings) >= 2:
+            t, d = np.array(readings).T
+            slope, icpt = np.polyfit(t - self.stop_t, d, 1)
+            return float(icpt), (f'fit of {len(readings)} scans, last one '
+                                 f'{(self.stop_t - t[-1]) * 1000:.0f} ms before, '
+                                 f'{-slope:.1f} cm/s')
+        if readings:
+            return readings[-1][1], 'last scan only'
+        return None
+
     def _check_standstill(self):
-        after = [d for t, d in self.readings if t > self.stop_t]
+        after = [d for t, d, *_ in self.readings if t > self.stop_t]
         if len(after) >= self.STILL_SCANS:
             last = after[-self.STILL_SCANS:]
             if max(last) - min(last) <= self.STILL_SPAN_CM:
@@ -103,24 +116,24 @@ class BrakeMonitor(Node):
             self.stop_t = None
 
     def _report(self, d_still: float):
-        before = [(t, d) for t, d in self.readings
-                  if self.stop_t - self.FIT_S <= t <= self.stop_t]
-        if len(before) >= 2:
-            t, d = np.array(before).T
-            slope, icpt = np.polyfit(t - self.stop_t, d, 1)
-            d_stop = float(icpt)                    # line evaluated at the STOP time
-            how = (f'fit of {len(before)} scans, last one '
-                   f'{(self.stop_t - t[-1]) * 1000:.0f} ms before, {-slope:.1f} cm/s')
-        elif before:
-            d_stop = before[-1][1]
-            how = 'last scan only'
-        else:
+        lo, hi = self.stop_t - self.FIT_S, self.stop_t
+        before = [r for r in self.readings if lo <= r[0] <= hi]
+        fit = self._fit_at_stop([(r[0], r[1]) for r in before])
+        if fit is None:
             self.get_logger().warn('BRAKE | no LiDAR reading before the STOP')
             return
+        d_stop, how = fit
         d_brake = d_stop - d_still
+        # Check of the ray timing (RAYS_REVERSED): which end of the array gave the minimum,
+        # and d_brake with the other timing rule. The used rule should give a value that
+        # does not depend on the end; the other one moves by ~2 * v * scan_time between ends.
+        ks = ' '.join(f'{r[2]}/{r[3]}' for r in before)
+        alt = self._fit_at_stop([(r[4], r[1]) for r in self.readings if lo <= r[4] <= hi])
+        alt_txt = f'{alt[0] - d_still:.2f} cm' if alt else '?'
         self.get_logger().info(f'BRAKE | d(STOP) {d_stop:.2f} cm ({how}) | '
                                f'd(standstill) {d_still:.2f} cm | '
-                               f'd_brake {d_brake:.2f} cm -> {BRAKE_TOPIC}')
+                               f'd_brake {d_brake:.2f} cm -> {BRAKE_TOPIC} | '
+                               f'check: rays k/n {ks}, other timing rule {alt_txt}')
         self.pub.publish(Float32(data=float(d_brake)))
 
 
