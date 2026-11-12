@@ -84,7 +84,7 @@ class LaserProcessor(Node):
     LINEAR_SPEED = 0.5              # m/s
 
     # --- Retransmission count N ---
-    P_TARGET = 0.30
+    P_TARGET = 0.05
     MAX_LINEAR_STEPS = 4
     N_MAX = 20000                   # hard cap (prevents endless loops if p ~ 1) (was 200)
 
