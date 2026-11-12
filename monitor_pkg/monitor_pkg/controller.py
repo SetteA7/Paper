@@ -78,13 +78,13 @@ class LaserProcessor(Node):
     D_BRAKE = 11                 # braking distance (cm), AUTO: run 0 only (see CALIBRATION_RUN)
     VMAX = 43.5                    # max speed (cm/s), AUTO: run 0 only (see CALIBRATION_RUN)
     T = 100                         # control period (ms) SAME AS LIDAR
-    SAFE_THRESHOLD = 75             # fixed brake threshold [S] (cm), used when SMART is off
+    SAFE_THRESHOLD = 42.6             # fixed brake threshold [S] (cm), used when SMART is off
 
     # NOTE: 0.5 m/s = 50 cm/s is ABOVE VMAX since actuators don't reach real speed
     LINEAR_SPEED = 0.5              # m/s
 
     # --- Retransmission count N ---
-    P_TARGET = 0.05
+    P_TARGET = 0.30
     MAX_LINEAR_STEPS = 4
     N_MAX = 20000                   # hard cap (prevents endless loops if p ~ 1) (was 200)
 
