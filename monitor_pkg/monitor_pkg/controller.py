@@ -35,11 +35,11 @@ DEFAULT_RUNS = 1        # runs when RUNS= is not given (each run returns to the 
 #   SMART       S_high: budget T*(N*+1), safe for any waits (conservative)
 #   SUPERSMART  S_smart: budget B_min, lowest S with exact P_crash <= P_TARGET, given the
 #               measured psi (thesis 5.7)
-# psi = wait from a scan reaching the controller to the control tick (timer, period T)
-# that sends the command. Measured here on every tick; it enters the budget
+# psi = wait from a scan reaching the controller to the next control tick (timer, period T),
+# the one that sends the command. Measured here for every scan; it enters the budget
 # B = dt - tau_e2e - psi of SUPERSMART and of the logged P_crash (all modes).
 # CSV: psi_ms = psi used by the model (PSI_QUANTILE of the last PSI_WINDOW waits, nearly
-# constant), psi_sample_ms = the measured wait of the command based on that row's scan.
+# constant), psi_sample_ms = wait from that row's scan's arrival to the next control tick.
 DEFAULT_MODE = 'FIXED'
 MODES = ('FIXED', 'SMART', 'SUPERSMART')
 ENABLE_CSV = True      # True: write one CSV row per scan into CSV_DIR
@@ -95,7 +95,7 @@ class LaserProcessor(Node):
     SCAN_LOSS_WINDOW = 100          # scans in p_scan (10 s, as the heartbeats' window)
 
     # --- psi: wait from scan arrival to the control tick that sends the command ---
-    PSI_WINDOW = 50                 # psi samples kept, one per control tick (5 s)
+    PSI_WINDOW = 50                 # psi samples kept, one per scan (5 s)
     PSI_QUANTILE = 0.9              # psi used by the model: this quantile of the window. High,
                                     # so if jitter makes psi wrap around a tick, the late case counts
     PSI_MIN_SAMPLES = 10            # fewer samples than this: use psi = T (worst case)
@@ -181,10 +181,11 @@ class LaserProcessor(Node):
         self.recent_yaws = deque(maxlen=3)
 
         # --- psi (controller clock only, no sync needed) ---
-        self.psi_samples = deque(maxlen=self.PSI_WINDOW)  # ms
+        self.psi_samples = deque(maxlen=self.PSI_WINDOW)  # ms, one per scan
         self.psi = float(self.T)        # ms, value used by the model (worst case until measured)
-        self.psi_last = float('nan')    # ms, last sample: wait of the last command sent
-        self._scan_arrival_mono = None  # monotonic ns of the newest scan not yet answered
+        self.psi_last = float('nan')    # ms, wait of the newest scan answered at the last tick
+        self.psi_detect = float('nan')  # ms, wait of the first scan below S answered at the last tick
+        self._unanswered = []           # scans since the last tick: (arrival monotonic ns, csv row, below S)
 
         # --- Network (placeholders until the first heartbeat from the bot) ---
         # tau_tx, tau_rx, taue2e: always the network node's (ping) values
@@ -213,7 +214,6 @@ class LaserProcessor(Node):
         # --- CSV ---
         self.csv_file = None
         self.csv_writer = None
-        self._pending_row = None        # row of the newest scan, written at the tick that answers it
         # AUTO mode opens one CSV per run itself
         self.auto = AutoTest(self, runs) if runs > 0 else None
         if log_csv and self.auto is None:
@@ -277,7 +277,7 @@ class LaserProcessor(Node):
 
     def _csv_row(self, lidar_ns: int, arrival_ns: int, scan_time_ms: float) -> list:
         """Row of one scan; psi_sample_ms is known only at the next tick, so it is a None
-        placeholder filled by _flush_csv_row.
+        placeholder filled by _write_row.
         lidar = msg.header.stamp (set by the driver on the bot when the scan was taken),
         arrival = controller clock when the scan reached scan_callback.
         delay = arrival - lidar; only meaningful if both clocks are synced (chrony).
@@ -291,22 +291,27 @@ class LaserProcessor(Node):
             f"{self.p_tx:.4f}", f"{self.p_rx:.4f}", f"{self.pe2e:.4f}",
             f"{self.budget_ms:.2f}", f"{self.p_crash:.6f}", f"{self.VMAX:.2f}", f"{self.psi:.2f}",
             f"{self.tau_rx_scan:.2f}", f"{self.tau_e2e_model:.2f}",
-            None,                       # psi_sample_ms (_flush_csv_row)
+            None,                       # psi_sample_ms (_write_row)
             f"{self.p_scan:.4f}"
         ]
 
-    def _flush_csv_row(self, psi_sample: float | None = None):
-        """Write the pending scan row. psi_sample_ms = wait from its arrival to the tick that
-        sent the command based on it (controller clock only); empty if no tick answered it
-        (a newer scan arrived first, or the CSV is being closed)."""
-        row, self._pending_row = self._pending_row, None
+    def _write_row(self, row: list | None, psi_sample: float | None):
+        """Write one scan row. psi_sample_ms = wait from its arrival to the next control tick
+        (controller clock only); empty if no tick answered it yet (CSV being closed)."""
         if row is not None and self.csv_writer is not None:
             row[row.index(None)] = f"{psi_sample:.2f}" if psi_sample is not None else ''
             self.csv_writer.writerow(row)
 
+    def _flush_unanswered(self):
+        """CSV being closed: rows of scans no tick answered yet, with an empty psi.
+        Their arrivals stay, so the next tick still counts their psi."""
+        for _, row, _ in self._unanswered:
+            self._write_row(row, None)
+        self._unanswered = [(a, None, b) for a, _, b in self._unanswered]
+
     def close_csv_run(self):
         """Close the current CSV only (AUTO mode: end of a run)."""
-        self._flush_csv_row()
+        self._flush_unanswered()
         if self.csv_file is not None and not self.csv_file.closed:
             self.csv_file.flush()
             self.csv_file.close()
@@ -314,7 +319,7 @@ class LaserProcessor(Node):
 
     def close_csv(self):
         """Idempotent: safe to call even if CSV logging is disabled."""
-        self._flush_csv_row()
+        self._flush_unanswered()
         if self.csv_file is not None and not self.csv_file.closed:
             self.csv_file.flush()
             self.csv_file.close()
@@ -381,21 +386,29 @@ class LaserProcessor(Node):
         self.p_crash = crash_model.p_crash(self.budget_ms, self.T, self.p_tx, self.p_rx_model)
 
     def _measure_psi(self):
-        """Called at the start of every control tick: if a scan arrived since the last
-        tick, psi = now - its arrival is the wait of the command sent now.
+        """Start of every control tick: every scan that arrived since the last tick waited
+        until now, so psi = now - its arrival, one sample per scan (also a scan a newer one
+        replaced: the model's psi is the detecting scan's wait to the tick, whatever scan
+        that tick looks at). psi_detect = wait of the first of them below S.
         psi is constant while the nodes run (LiDAR and timer both have period T), up to
         latency jitter; the model uses a high quantile of the last samples."""
-        if self._scan_arrival_mono is None:
+        if not self._unanswered:
             return
-        self.psi_last = (time.monotonic_ns() - self._scan_arrival_mono) * 1e-6
-        self._scan_arrival_mono = None
-        self._flush_csv_row(self.psi_last)          # that scan's row gets its own wait
-        self.psi_samples.append(self.psi_last)
+        now = time.monotonic_ns()
+        self.psi_detect = float('nan')
+        for arrival, row, below in self._unanswered:
+            psi = (now - arrival) * 1e-6
+            self._write_row(row, psi)
+            self.psi_samples.append(psi)
+            if below and np.isnan(self.psi_detect):
+                self.psi_detect = psi
+        self._unanswered.clear()
+        self.psi_last = psi             # newest scan: the one this tick's command is based on
         if len(self.psi_samples) >= self.PSI_MIN_SAMPLES:
             self.psi = float(np.quantile(self.psi_samples, self.PSI_QUANTILE))
 
     def scan_callback(self, msg: LaserScan):
-        self._scan_arrival_mono = time.monotonic_ns()   # for psi (newest scan wins)
+        arrival_mono = time.monotonic_ns()              # for psi
         arrival_ns = self.get_clock().now().nanoseconds
         self.last_scan_ns = arrival_ns
         lidar_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
@@ -403,7 +416,7 @@ class LaserProcessor(Node):
         # Downlink loss of whole scans from gaps in header.stamp (end to end, see ScanLoss),
         # always logged; the model uses it only with use_ping False (see p_rx_model)
         self.scan_loss.on_message(lidar_ns * 1e-9, msg.scan_time or self.T / 1000.0,
-                                  self._scan_arrival_mono * 1e-9)
+                                  arrival_mono * 1e-9)
         self.p_scan = self.scan_loss.loss
         # Downlink latency measured on the real sensor data (needs synced clocks), always
         # logged; the model uses it only with use_ping False (see tau_e2e_model):
@@ -443,10 +456,12 @@ class LaserProcessor(Node):
         if self.auto is not None:
             self.auto.on_scan()
 
-        # Row held until the tick that answers this scan fills psi_sample_ms
-        self._flush_csv_row()                       # previous scan never got a tick of its own
-        if self.csv_writer is not None:
-            self._pending_row = self._csv_row(lidar_ns, arrival_ns, msg.scan_time * 1000.0)
+        # Every scan waits for the next tick, also one a newer scan replaces before it;
+        # its row is held until that tick fills psi_sample_ms
+        row = (self._csv_row(lidar_ns, arrival_ns, msg.scan_time * 1000.0)
+               if self.csv_writer is not None else None)
+        self._unanswered.append((arrival_mono, row,
+                                 self.scan_status == 'ok' and self.last_brake_state))
 
     def _fit_wall_yaw(self, ranges: np.ndarray, msg: LaserScan) -> float | None:
         """Yaw error (rad) between the robot heading and the normal of the surface ahead.
@@ -989,9 +1004,12 @@ class AutoTest:
                               B=n.budget_ms, pc=n.p_crash,
                               tau=n.taue2e, tau_model=n.tau_e2e_model,
                               p=n.pe2e, v=v, n_cruise=n_cruise,
-                              # psi_last was measured at the start of this tick: the
-                              # wait of the STOP that is being sent now
-                              psi=n.psi, psi_stop=n.psi_last)
+                              psi=n.psi,
+                              # measured at the start of this tick: wait of the first scan
+                              # below S (it triggered the STOP), not of the newest scan
+                              # the tick looked at
+                              psi_stop=n.psi_detect if not np.isnan(n.psi_detect)
+                              else n.psi_last)
             cruise = (f'cruise {v:.2f} cm/s over {n_cruise} scans' if v is not None else
                       f'cruise speed not measured (no steady part of >= '
                       f'{n.CRUISE_MIN_SCANS} scans before the brake)')
